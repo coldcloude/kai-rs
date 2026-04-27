@@ -4,6 +4,7 @@ pub mod tokenizer;
 pub mod index;
 
 pub mod distinct_index;
+pub mod recursive_index;
 pub mod simple_index;
 pub mod atomic_index;
 pub mod index_search;
@@ -20,6 +21,7 @@ pub use index::Index;
 pub use index_search::IndexSearch;
 pub use simple_index::SimpleIndex;
 pub use atomic_index::AtomicIndex;
+pub use recursive_index::RecursiveIndex;
 pub use substring_tokenizer::SubstringTokenizer;
 pub use substring_index::SubstringIndex;
 pub use splintr_tokenizer::SplintrTokenizer;

@@ -1,4 +1,4 @@
-use std::{collections::{HashMap, HashSet, LinkedList}, hash::Hash};
+use std::{collections::{HashMap, HashSet, LinkedList, hash_map::Entry}, hash::Hash};
 
 use crate::{Error, error::Result, index::{Index, IndexWithDetail, Split}};
 
@@ -20,6 +20,48 @@ where
         Self {
             sub_tree_map: None,
             leaf_set: None,
+        }
+    }
+
+    pub fn get_sub_tree(&mut self, token: T) -> &mut Self {
+        self.sub_tree_map.get_or_insert_with(|| HashMap::new()).entry(token).or_insert_with(|| Self::new())
+    }
+
+    pub fn insert_leaf(&mut self, key: K, index: usize, start: usize) {
+        self.leaf_set.get_or_insert_with(|| HashMap::new()).entry(key).or_insert_with(|| Vec::new()).push(Split {index, start});
+    }
+
+    pub fn remove(&mut self, key: &K, tokens: &mut LinkedList<T>) {
+        match tokens.pop_front() {
+            Some(token) => {
+                //中间节点
+                if let Some(sub_tree_map) = self.sub_tree_map.as_mut() {
+                    if let Entry::Occupied(mut sub_tree_entry) = sub_tree_map.entry(token) {
+                        //存在token对应的子节点，递归执行子节点移除
+                        let sub_tree = sub_tree_entry.get_mut();
+                        sub_tree.remove(key, tokens);
+                        //如果子节点里没有数据了，移除子节点
+                        if sub_tree.leaf_set.is_none() && sub_tree.sub_tree_map.is_none() {
+                            sub_tree_entry.remove();
+                        }
+                    }
+                    //如果没有子节点了，移除子节点表
+                    if sub_tree_map.is_empty() {
+                        self.sub_tree_map = None;
+                    }
+                }
+            }
+            None => {
+                //叶子节点
+                if let Some(leaf_set) = self.leaf_set.as_mut() {
+                    //移除叶子
+                    leaf_set.remove(&key);
+                    //如果叶子节点为空，移除叶子表
+                    if leaf_set.is_empty() {
+                        self.leaf_set = None;
+                    }
+                }
+            }
         }
     }
 
@@ -46,13 +88,7 @@ where
     }
 }
 
-struct EmptyCheck {
-    sub_tree_map_size: usize,
-    leaf_set_size: usize,
-    should_remove_sub_tree: bool
-}
-
-pub struct SimpleIndex<T,K>
+pub struct RecursiveIndex<T,K>
 where
     T: Eq + Hash + Clone + 'static,
     K: Eq + Hash + Clone + ToString + 'static,
@@ -63,7 +99,7 @@ where
     max_depth: usize,
 }
 
-impl<T,K> SimpleIndex<T,K>
+impl<T,K> RecursiveIndex<T,K>
 where
     T: Eq + Hash + Clone + 'static,
     K: Eq + Hash + Clone + ToString + 'static,
@@ -92,10 +128,10 @@ where
             };
             //每个token一个子树
             while let Some(token) = valid_tokens.pop_front() {
-                current_tree = current_tree.sub_tree_map.get_or_insert_with(|| HashMap::new()).entry(token).or_insert_with(|| TokenNode::new());
+                current_tree = current_tree.get_sub_tree(token);
             }
             //在叶子节点记录文档id
-            current_tree.leaf_set.get_or_insert_with(|| HashMap::new()).entry(key.clone()).or_insert_with(|| Vec::new()).push(Split {index, start});
+            current_tree.insert_leaf(key.clone(), index, start);
         }
     }
 
@@ -106,110 +142,17 @@ where
             for curr in start..std::cmp::min(start + self.max_depth, tokens.len()) {
                 valid_tokens.push_back(tokens[curr].clone());
             }
-            //记录当前节点，前缀子串和其他子串根不同
-            let mut current_tree_or_none = if start == 0 {
-                Some(&mut self.prefix_tree)
+            //前缀子串单独存
+            if start == 0 {
+                self.prefix_tree.remove(key, &mut valid_tokens);
             } else {
-                Some(&mut self.tree)
+                self.tree.remove(key, &mut valid_tokens);
             };
-            //记录当前节点是否要删除
-            let mut should_remove = false;
-            //记录移除前的子树大小
-            let mut check_list: Vec<EmptyCheck> = Vec::new();
-            for token in valid_tokens.iter() {
-                //未找到子树时自动留空
-                if let Some(current_tree) = current_tree_or_none.take() {
-                    //记录当前子树大小
-                    let sub_tree_map_size = match current_tree.sub_tree_map.as_ref() {
-                        Some(sub_tree_map) => sub_tree_map.len(),
-                        None => 0,
-                    };
-                    //记录当前叶子节点大小
-                    let leaf_set_size = match current_tree.leaf_set.as_ref() {
-                        Some(leaf_set) => leaf_set.len(),
-                        None => 0,
-                    };
-                    //检查当前子树是否要移除
-                    should_remove = sub_tree_map_size == 0 && leaf_set_size == 0;
-                    //搜索当前子树
-                    if let Some(sub_tree_map) = current_tree.sub_tree_map.as_mut() {
-                        if let Some(sub_tree) = sub_tree_map.get_mut(&token) {
-                            //保存当前子树大小
-                            check_list.push(EmptyCheck {
-                                sub_tree_map_size: sub_tree_map_size,
-                                leaf_set_size: leaf_set_size,
-                                should_remove_sub_tree: false
-                            });
-                            //搜索下一个子树
-                            current_tree_or_none = Some(sub_tree);
-                        }
-                    };
-                }
-                //无法继续遍历，结束
-                if current_tree_or_none.is_none() {
-                    break;
-                }
-            }
-            //如果找到叶子节点，先移除叶子节点
-            if let Some(current_tree) = current_tree_or_none.as_mut() {
-                //检查叶子节点的子树，是否需要移除
-                should_remove = match current_tree.sub_tree_map.as_ref() {
-                    Some(sub_tree_map) => sub_tree_map.is_empty(),
-                    None => true,
-                };
-                if let Some(leaf_set) = current_tree.leaf_set.as_mut() {
-                    //移除叶子节点
-                    leaf_set.remove(&key);
-                    //如果当前节点的子树和叶子均为空，应该移除当前子树
-                    should_remove = should_remove && leaf_set.is_empty();
-                }
-            }
-            //如果最后节点为空，则需要递归移除
-            if should_remove {
-                //回溯并标记移除
-                let mut index = check_list.len()-1;
-                while should_remove {
-                    let check = &mut check_list[index];
-                    //标记移除本节点的这个子树
-                    check.should_remove_sub_tree = true;
-                    //如果只有这个子树，应该移除当前子树
-                    should_remove = check.sub_tree_map_size <= 1 && check.leaf_set_size == 0;
-                    //回溯上一个子树
-                    index -= 1;
-                }
-                //根据标记，直接移除最上层子树
-                let mut current_tree_or_none = if start == 0 {
-                    Some(&mut self.prefix_tree)
-                } else {
-                    Some(&mut self.tree)
-                };
-                //搜索最上层要移除的子树
-                for token in valid_tokens.iter() {
-                    if let Some(current_tree) = current_tree_or_none.take() {
-                        if let Some(sub_tree_map) = current_tree.sub_tree_map.as_mut() {
-                            if check_list[index].should_remove_sub_tree {
-                                //移除子树
-                                sub_tree_map.remove(token);
-                                //无需继续遍历
-                                break;
-                            }
-                            else {
-                                //继续遍历下一个子树
-                                current_tree_or_none = sub_tree_map.get_mut(token);
-                            }
-                        }
-                    }
-                    //无法继续遍历，结束
-                    if current_tree_or_none.is_none() {
-                        break;
-                    }
-                }
-            }
         }
     }
 }
 
-impl<T,K> Index<T,K> for SimpleIndex<T,K>
+impl<T,K> Index<T,K> for RecursiveIndex<T,K>
 where
     T: Eq + Hash + Clone + 'static,
     K: Eq + Hash + Clone + ToString + 'static,
@@ -230,7 +173,7 @@ where
     }
 }
 
-impl<T,K> IndexWithDetail<T,K> for SimpleIndex<T,K>
+impl<T,K> IndexWithDetail<T,K> for RecursiveIndex<T,K>
 where
     T: Eq + Hash + Clone + 'static,
     K: Eq + Hash + Clone + ToString + 'static,

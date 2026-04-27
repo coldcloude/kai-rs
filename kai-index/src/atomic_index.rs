@@ -88,7 +88,7 @@ where
             for curr in start..std::cmp::min(start + self.max_depth, tokens.len()) {
                 valid_tokens.push_back(tokens[curr].clone());
             }
-            //前缀子串单独存
+            //记录当前节点，前缀子串和其他子串根不同
             let mut current_tree = if start == 0 {
                 self.prefix_tree.clone()
             } else {
