@@ -155,7 +155,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "kissbot"
+name = "kai_index"
 version = "0.1.0"
 dependencies = [
  "dashmap",

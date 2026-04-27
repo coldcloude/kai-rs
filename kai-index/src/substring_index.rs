@@ -1,6 +1,6 @@
 use std::hash::Hash;
 
-use crate::{Document, atomic_index::AtomicIndex, error::Result, index_search::IndexSearch, substring_tokenizer::{SubstringToken, SubstringTokenizer}};
+use crate::{Document, atomic_index::AtomicIndex, index_search::IndexSearch, substring_tokenizer::{SubstringToken, SubstringTokenizer}};
 
 pub struct SubstringIndex<K>
 where
@@ -19,7 +19,7 @@ where
         }
     }
 
-    pub fn insert<D:Document>(&mut self, key: &K, doc: &D) -> Result<()> {
+    pub fn insert<D:Document>(&mut self, key: &K, doc: &D) {
         self.index_search.insert(key, doc)
     }
 

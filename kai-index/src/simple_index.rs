@@ -112,6 +112,44 @@ where
             max_depth,
         }
     }
+
+    fn insert_one(&mut self, key: &K, index: usize, content: &Vec<T>) {
+        //取所有长度不超过max_depth的子串进行索引
+        for start in 0..content.len() {
+            let mut valid_tokens = LinkedList::new();
+            for curr in start..std::cmp::min(start + self.max_depth, content.len()) {
+                valid_tokens.push_back(content[curr].clone());
+            }
+            //前缀子串单独存
+            let mut current_tree = if start == 0 {
+                &mut self.prefix_tree
+            } else {
+                &mut self.tree
+            };
+            //每个token一个子树
+            while let Some(token) = valid_tokens.pop_front() {
+                current_tree = current_tree.get_sub_tree(token);
+            }
+            //在叶子节点记录文档id
+            current_tree.insert_leaf(key.clone(), index, start);
+        }
+    }
+
+    fn remove_one(&mut self, key: &K, tokens: Vec<T>) {
+        //取所有长度不超过max_depth的子串进行索引
+        for start in 0..tokens.len() {
+            let mut valid_tokens = LinkedList::new();
+            for curr in start..std::cmp::min(start + self.max_depth, tokens.len()) {
+                valid_tokens.push_back(tokens[curr].clone());
+            }
+            //前缀子串单独存
+            if start == 0 {
+                self.prefix_tree.remove(key, &mut valid_tokens);
+            } else {
+                self.tree.remove(key, &mut valid_tokens);
+            };
+        }
+    }
 }
 
 impl<T,K> Index<T,K> for SimpleIndex<T,K>
@@ -119,40 +157,15 @@ where
     T: Eq + Hash + Clone + 'static,
     K: Eq + Hash + Clone + ToString + 'static,
 {
-    fn insert(&mut self, key: &K, contents: impl IntoIterator<Item = Vec<T>>) -> Result<()> {
-        match self.documents.entry(key.clone()) {
-            Entry::Occupied(_) => {
-                Err(Error::DuplicatedDocumentKey(key.to_string()))
-            }
-            Entry::Vacant(entry) => {
-                let mut tokens_list = Vec::new();
-                for (index, content) in contents.into_iter().enumerate() {
-                    //取所有长度不超过max_depth的子串进行索引
-                    for start in 0..content.len() {
-                        let mut valid_tokens = LinkedList::new();
-                        for curr in start..std::cmp::min(start + self.max_depth, content.len()) {
-                            valid_tokens.push_back(content[curr].clone());
-                        }
-                        //前缀子串单独存
-                        let mut current_tree = if start == 0 {
-                            &mut self.prefix_tree
-                        } else {
-                            &mut self.tree
-                        };
-                        //每个token一个子树
-                        while let Some(token) = valid_tokens.pop_front() {
-                            current_tree = current_tree.get_sub_tree(token);
-                        }
-                        //在叶子节点记录文档id
-                        current_tree.insert_leaf(key.clone(), index, start);
-                    }
-                    //保存文档内容用于移除
-                    tokens_list.push(content);
-                }
-                entry.insert(tokens_list);
-                Ok(())
-            }
+    fn insert(&mut self, key: &K, contents: impl IntoIterator<Item = Vec<T>>) {
+        let mut tokens_list = Vec::new();
+        for (index, content) in contents.into_iter().enumerate() {
+            //处理当前tokens
+            self.insert_one(key, index, &content);
+            //保存文档内容用于移除
+            tokens_list.push(content);
         }
+        self.documents.insert(key.clone(), tokens_list);
     }
 
     fn find(&self, query: &[T]) -> HashSet<K> {
@@ -169,19 +182,7 @@ where
         if let Some(tokens_list) = self.documents.remove(key) {
             //找到对应的文档，并移除其中所有token序列
             for tokens in tokens_list {
-                //取所有长度不超过max_depth的子串进行索引
-                for start in 0..tokens.len() {
-                    let mut valid_tokens = LinkedList::new();
-                    for curr in start..std::cmp::min(start + self.max_depth, tokens.len()) {
-                        valid_tokens.push_back(tokens[curr].clone());
-                    }
-                    //前缀子串单独存
-                    if start == 0 {
-                        self.prefix_tree.remove(key, &mut valid_tokens);
-                    } else {
-                        self.tree.remove(key, &mut valid_tokens);
-                    };
-                }
+                self.remove_one(key, tokens);
             }
         }
     }

@@ -20,7 +20,7 @@ where
         })
     }
 
-    pub fn insert<D:Document>(&mut self, key: &K, doc: &D) -> Result<()> {
+    pub fn insert<D:Document>(&mut self, key: &K, doc: &D) {
         self.index_search.insert(key, doc)
     }
 

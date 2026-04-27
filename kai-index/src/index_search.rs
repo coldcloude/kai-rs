@@ -1,6 +1,6 @@
 use std::{collections::{HashMap, HashSet, LinkedList, hash_map::Entry}, hash::Hash, marker::PhantomData, ops::Range, rc::Rc};
 
-use crate::{Document, error::Result, index::{Index, IndexRemovable, IndexWithDetail, Split}, tokenizer::Tokenizer};
+use crate::{Document, index::{Index, IndexRemovable, IndexWithDetail, Split}, tokenizer::Tokenizer};
 
 pub fn split<T>(tokens: &Vec<T>) -> Vec<Vec<Range<usize>>> {
     let mut result_splits: Vec<Vec<Range<usize>>> = Vec::new();
@@ -252,7 +252,7 @@ where
         }
     }
 
-    pub fn insert<D>(&mut self, key: &K, document: &D) -> Result<()>
+    pub fn insert<D>(&mut self, key: &K, document: &D)
     where
         D: Document,
     {
