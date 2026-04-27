@@ -2,6 +2,7 @@ pub mod error;
 pub mod document;
 pub mod tokenizer;
 pub mod index;
+pub mod hierarchical_tree;
 
 pub mod distinct_index;
 pub mod recursive_index;
