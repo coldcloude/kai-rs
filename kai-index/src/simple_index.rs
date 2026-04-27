@@ -35,12 +35,18 @@ where
     }
 
     fn get_all(&self, result: &mut HashMap<K,Vec<Split>>) {
-        //将叶子节点内容加入结果集
-        self.get(result);
-        //将子树加入队列
-        if let Some(sub_tree_map) = self.sub_tree_map.as_ref() {
-            for node in sub_tree_map.values() {
-                node.get_all(result);
+        //使用栈辅助遍历
+        let mut tree_list: LinkedList<&TokenNode<T,K>> = LinkedList::new();
+        //加入根
+        tree_list.push_back(self);
+        while let Some(tree) = tree_list.pop_back() {
+            //将叶子节点内容加入结果集
+            self.get(result);
+            //将子树加入队列
+            if let Some(sub_tree_map) = tree.sub_tree_map.as_ref() {
+                for sub_tree in sub_tree_map.values() {
+                    tree_list.push_back(sub_tree);
+                }
             }
         }
     }
@@ -173,7 +179,7 @@ where
                     //标记移除本节点的这个子树
                     check.should_remove_sub_tree = true;
                     //如果只有这个子树，应该移除当前子树
-                    should_remove = check.sub_tree_map_size <= 1 && check.leaf_set_size == 0;
+                    should_remove = check.sub_tree_map_size == 1 && check.leaf_set_size == 0;
                     //回溯上一个子树
                     index -= 1;
                 }
