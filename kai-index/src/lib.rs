@@ -18,11 +18,13 @@ pub mod splintr_index;
 pub use error::Error;
 pub use document::Document;
 pub use tokenizer::Tokenizer;
-pub use index::Index;
+pub use index::{Index, IndexWithDetail, IndexRemovable};
 pub use index_search::IndexSearch;
-pub use simple_index::SimpleIndex;
-pub use atomic_index::AtomicIndex;
 pub use recursive_index::RecursiveIndex;
+pub use atomic_index::AtomicIndex;
+pub use hierarchical_tree::HierarchicalTree;
+pub use simple_index::SimpleIndex;
+pub use distinct_index::{build_single_index, DistinctIndex};
 pub use substring_tokenizer::SubstringTokenizer;
 pub use substring_index::SubstringIndex;
 pub use splintr_tokenizer::SplintrTokenizer;
@@ -36,33 +38,50 @@ mod tests {
     #[test]
     fn test_splintr_tokenize() {
         let tokenizer = SplintrTokenizer::new("deepseek_v3").unwrap();
-        let content = "Hello, world!";
-        let tokens = tokenizer.tokenize(content);
+        let tokens = tokenizer.tokenize("Hello, world!");
         assert_eq!(tokens, vec![19923, 14, 2058, 3]);
-        let mut contents = content.split_whitespace();
-        let tokens = tokenizer.tokenize(contents.next().unwrap());
-        assert_eq!(tokens, vec![19923, 14]);
-        let tokens = tokenizer.tokenize(contents.next().unwrap()); 
-        assert_eq!(tokens, vec![29616, 3]);
+        let tokens = tokenizer.tokenize("hello,world!");
+        assert_eq!(tokens, vec![33310, 14, 29616, 3]);
     }
 
     #[test]
     fn test_splintr_untokenize() {
         let tokenizer = SplintrTokenizer::new("deepseek_v3").unwrap();
-        let tokens = vec![19923, 14, 2058, 3];
-        let content = tokenizer.untokenize(&tokens).unwrap();
+        let content = tokenizer.untokenize(&vec![19923, 14, 2058, 3]).unwrap();
         assert_eq!(content, "Hello, world!");
+        let content = tokenizer.untokenize(&vec![33310, 14, 29616, 3]).unwrap();
+        assert_eq!(content, "hello,world!");
     }
 
     #[test]
     fn test_substring_tokenizer() {
         let tokenizer = SubstringTokenizer {};
-        let content = "Hello, world!";
-        let tokens = tokenizer.tokenize(content);
+        let tokens = tokenizer.tokenize("Hello, world!");
         assert_eq!(tokens.iter().map(|x| x.token.clone()).collect::<Vec<_>>(), vec!["hello", ",", "world", "!"]);
         let recover = tokenizer.untokenize(&tokens).unwrap();
         assert_eq!(recover, "hello,world!");
         let tokens = tokenizer.tokenize(&recover);
         assert_eq!(tokens.iter().map(|x| x.token.clone()).collect::<Vec<_>>(), vec!["hello", ",", "world", "!"]);
+    }
+
+    #[test]
+    fn test_distinct_index() {
+        let single_index = build_single_index(vec![vec![1,1,1,1,1]], 3);
+        single_index.for_each(&mut |x| {
+            println!("{:?}", x);
+        });
+        let mut distinct_index: DistinctIndex<i32, String> = DistinctIndex::new(3);
+        let key = String::from("a");
+        distinct_index.insert(&key, vec![vec![1,1,1,1,1]]);
+        let result = distinct_index.find(&vec![1]);
+        assert_eq!(result.contains(&key), true);
+        let result = distinct_index.find(&vec![1,1]);
+        assert_eq!(result.contains(&key), true);
+        let result = distinct_index.find(&vec![1,1,1]);
+        assert_eq!(result.contains(&key), true);
+        let result = distinct_index.find(&vec![1,1,1,1]);
+        assert_eq!(result.contains(&key), false);
+        let result = distinct_index.find(&vec![1,1,1,1,1]);
+        assert_eq!(result.contains(&key), false);
     }
 }

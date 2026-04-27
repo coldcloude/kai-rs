@@ -1,6 +1,6 @@
 use std::{collections::{HashMap, HashSet, LinkedList}, hash::Hash};
 
-use crate::hierarchical_tree::{Collection, HierarchicalTree};
+use crate::{Index, hierarchical_tree::{Collection, HierarchicalTree}, index::IndexRemovable};
 
 pub struct SingleIndexNode<T>
 where
@@ -18,9 +18,61 @@ where
             sub_tree_map: None,
         }
     }
+
+    pub fn for_each<F>(&self, op: &mut F)
+    where
+        F: FnMut(&mut Vec<T>),
+    {
+        let mut buffer: LinkedList<T> = LinkedList::new();
+        let mut layer_list = LinkedList::new();
+        let mut current_node_or_none = Some(self);
+        while let Some(current_node) = current_node_or_none.take() {
+            match current_node.sub_tree_map.as_ref() {
+                Some(map) => {
+                    //中间节点，前进一层
+                    let mut layer = LinkedList::new();
+                    for (token, node) in map.iter() {
+                        layer.push_back((token.clone(), node));
+                    }
+                    layer_list.push_back(layer);
+                }
+                None => {
+                    //叶子节点，添加为tokens
+                    if !buffer.is_empty() {
+                        //将当前序列作为token添加
+                        let mut tokens = Vec::new();
+                        for token in buffer.iter() {
+                            tokens.push(token.clone());
+                        }
+                        op(&mut tokens);
+                    }
+                    //回退一层
+                    buffer.pop_back();
+                }
+            }
+            //取出一层
+            while let Some(mut layer) = layer_list.pop_back() {
+                //取出一个节点
+                if let Some((token, node)) = layer.pop_back() {
+                    //取到节点，则前进一层
+                    buffer.push_back(token);
+                    current_node_or_none = Some(node);
+                    //将本层放回，以保持层数不会回退
+                    layer_list.push_back(layer);
+                    //结束本次取值
+                    break;
+                }
+                else {
+                    //如果本层为空，回退一层
+                    //在根节点会多回退一次，但是不影响
+                    buffer.pop_back();
+                }
+            }
+        }
+    }
 }
 
-pub fn build<T>(contents: impl IntoIterator<Item = Vec<T>>, max_depth: usize) -> SingleIndexNode<T>
+pub fn build_single_index<T>(contents: impl IntoIterator<Item = Vec<T>>, max_depth: usize) -> SingleIndexNode<T>
 where
     T: Eq + Hash + Clone + 'static,
 {
@@ -88,4 +140,49 @@ where
 {
     tree: DistinctIndexTree<T,K>,
     max_depth: usize,
+}
+
+impl<T,K> DistinctIndex<T,K>
+where
+    T: Eq + Hash + Clone + 'static,
+    K: Eq + Hash + Clone + ToString + 'static,
+{
+    pub fn new(max_depth: usize) -> Self {
+        Self {
+            tree: DistinctIndexTree::new(),
+            max_depth,
+        }
+    }
+}
+
+impl<T,K> Index<T,K> for DistinctIndex<T,K>
+where
+    T: Eq + Hash + Clone + 'static,
+    K: Eq + Hash + Clone + ToString + 'static,
+{
+    fn insert(&mut self, key: &K, contents: impl IntoIterator<Item = Vec<T>>) {
+        let single_index = build_single_index(contents, self.max_depth);
+        single_index.for_each(&mut |tokens| {
+            self.tree.insert(tokens, key.clone());
+        });
+    }
+
+    fn find(&self, query: &[T]) -> HashSet<K> {
+        let mut result: HashSet<K> = HashSet::new();
+        self.tree.find(query, &mut result);
+        result
+    }
+}
+
+impl<T,K> IndexRemovable<T,K> for DistinctIndex<T,K>
+where
+    T: Eq + Hash + Clone + 'static,
+    K: Eq + Hash + Clone + ToString + 'static,
+{
+    fn remove(&mut self, key: &K, contents: impl IntoIterator<Item = Vec<T>>) {
+        let single_index = build_single_index(contents, self.max_depth);
+        single_index.for_each(&mut |tokens| {
+            self.tree.remove(key, tokens);
+        });
+    }
 }
