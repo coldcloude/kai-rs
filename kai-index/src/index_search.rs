@@ -1,6 +1,6 @@
 use std::{collections::{HashMap, HashSet, LinkedList, hash_map::Entry}, hash::Hash, marker::PhantomData, ops::Range, rc::Rc};
 
-use crate::{Document, index::{Index, IndexRemovable, IndexWithDetail, Split}, tokenizer::Tokenizer};
+use crate::{Document, document::AsStr, index::{Index, IndexRemovable, IndexWithDetail, Split}, tokenizer::Tokenizer};
 
 pub fn split<T>(tokens: &Vec<T>) -> Vec<Vec<Range<usize>>> {
     let mut result_splits: Vec<Vec<Range<usize>>> = Vec::new();
@@ -252,13 +252,14 @@ where
         }
     }
 
-    pub fn insert<D>(&mut self, key: &K, document: &D)
+    pub fn insert<D,S>(&mut self, key: &K, document: &D)
     where
-        D: Document,
+        D: Document<S>,
+        S: AsStr,
     {
         let mut tokens_list: Vec<Vec<T>> = Vec::new();
         for content in document.contents() {
-            let splits = content.split_whitespace();
+            let splits = content.as_string().split_whitespace();
             let mut tokens: Vec<T> = Vec::new();
             for split in splits {
                 tokens.extend(self.tokenizer.tokenize(split));
@@ -317,9 +318,13 @@ where
     TKNZ: Tokenizer<T>,
     IDX: IndexRemovable<T,K>,
 {
-    pub fn remove_content<D:Document>(&mut self, key: &K, document: &D) {
+    pub fn remove_content<D,S>(&mut self, key: &K, document: &D)
+    where
+        D: Document<S>,
+        S: AsStr,
+    {
         let contents = document.contents();
-        self.index.remove(key, contents.into_iter().map(|content| self.tokenizer.tokenize(content.as_str())));
+        self.index.remove(key, contents.into_iter().map(|content| self.tokenizer.tokenize(content.as_string())));
     }
 }
 

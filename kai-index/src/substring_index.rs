@@ -1,6 +1,6 @@
 use std::hash::Hash;
 
-use crate::{DistinctIndex, Document, index_search::IndexSearch, substring_tokenizer::{SubstringToken, SubstringTokenizer}};
+use crate::{DistinctIndex, Document, document::AsStr, index_search::IndexSearch, substring_tokenizer::{SubstringToken, SubstringTokenizer}};
 
 pub struct SubstringIndex<K>
 where
@@ -19,11 +19,19 @@ where
         }
     }
 
-    pub fn insert<D:Document>(&mut self, key: &K, doc: &D) {
+    pub fn insert<D,S>(&mut self, key: &K, doc: &D)
+    where
+        D: Document<S>,
+        S: AsStr,
+    {
         self.index_search.insert(key, doc)
     }
 
-    pub fn remove<D:Document>(&mut self, key: &K, doc: &D) {
+    pub fn remove<D,S>(&mut self, key: &K, doc: &D)
+    where
+        D: Document<S>,
+        S: AsStr,
+    {
         self.index_search.remove_content(key,doc)
     }
 

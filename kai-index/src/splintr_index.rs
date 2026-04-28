@@ -1,6 +1,6 @@
 use std::hash::Hash;
 
-use crate::{Document, atomic_index::AtomicIndex, error::Result, index_search::IndexSearch, splintr_tokenizer::SplintrTokenizer};
+use crate::{Document, atomic_index::AtomicIndex, document::AsStr, error::Result, index_search::IndexSearch, splintr_tokenizer::SplintrTokenizer};
 
 pub struct SplintrIndex<K>
 where
@@ -20,7 +20,11 @@ where
         })
     }
 
-    pub fn insert<D:Document>(&mut self, key: &K, doc: &D) {
+    pub fn insert<D,S>(&mut self, key: &K, doc: &D)
+    where
+        D: Document<S>,
+        S: AsStr,
+    {
         self.index_search.insert(key, doc)
     }
 
