@@ -54,7 +54,7 @@ where
         }
     }
 
-    fn insert_one(&mut self, key: &K, index: usize, content: &Vec<T>) {
+    fn insert_one(&self, key: &K, index: usize, content: &Vec<T>) {
         //取所有长度不超过max_depth的子串进行索引
         for start in 0..content.len() {
             let mut valid_tokens = LinkedList::new();
@@ -81,7 +81,7 @@ where
         }
     }
 
-    fn remove_one(&mut self, key: &K, tokens: Vec<T>) {
+    fn remove_one(&self, key: &K, tokens: Vec<T>) {
         //取所有长度不超过max_depth的子串进行索引
         for start in 0..tokens.len() {
             let mut valid_tokens = LinkedList::new();
@@ -170,19 +170,13 @@ where
     K: Eq + Hash + Clone + Send + Sync + ToString + 'static,
 {
     fn insert(&mut self, key: &K, contents: impl IntoIterator<Item = Vec<T>>) {
-        let mut batch_tokens_list: Vec<Vec<T>> = Vec::new();
-        {
-            let mut documents_guard = self.documents.write();
-            let tokens_list = documents_guard.entry(key.clone()).or_insert_with(|| Vec::new());
-            for content in contents.into_iter() {
-                //保存用于后续分析索引
-                batch_tokens_list.push(content.clone());
-                //保存文档内容
-                tokens_list.push(content);
-            }
-        }
-        for index in 0..batch_tokens_list.len() {
-            self.insert_one(key, index, &batch_tokens_list[index]);
+        let mut documents_guard = self.documents.write();
+        let tokens_list = documents_guard.entry(key.clone()).or_insert_with(|| Vec::new());
+        for (index, content) in contents.into_iter().enumerate() {
+            //保存用于后续分析索引
+            self.insert_one(key, index, &content);
+            //保存文档内容
+            tokens_list.push(content);
         }
     }
 
@@ -197,11 +191,8 @@ where
     K: Eq + Hash + Clone + Send + Sync + ToString + 'static,
 {
     fn remove(&mut self, key: &K) {
-        let tokens_list_or_none: Option<Vec<Vec<T>>>;
-        {
-            let mut documents_guard = self.documents.write();
-            tokens_list_or_none = documents_guard.remove(key);
-        }
+        let mut documents_guard = self.documents.write();
+        let tokens_list_or_none = documents_guard.remove(key);
         if let Some(tokens_list) = tokens_list_or_none {
             //找到对应的文档，并移除其中所有token序列
             for tokens in tokens_list {
