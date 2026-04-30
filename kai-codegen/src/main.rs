@@ -178,6 +178,20 @@ fn rust_type_to_ts(rust_type: &str) -> String {
         return format!("{}[]", rust_type_to_ts(inner));
     }
     
+    if rust_type.starts_with("HashMap<") && rust_type.ends_with('>') {
+        let inner = &rust_type[8..rust_type.len() - 1];
+        if let Some(pos) = inner.find(", ") {
+            let key_type = rust_type_to_ts(&inner[0..pos]);
+            let value_type = rust_type_to_ts(&inner[pos+2..]);
+            return format!("Record<{}, {}>", key_type, value_type);
+        }
+        if let Some(pos) = inner.find(',') {
+            let key_type = rust_type_to_ts(&inner[0..pos]);
+            let value_type = rust_type_to_ts(&inner[pos+1..].trim());
+            return format!("Record<{}, {}>", key_type, value_type);
+        }
+    }
+    
     if let Some(&ts_type) = type_map.get(rust_type) {
         return ts_type.to_string();
     }

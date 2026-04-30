@@ -5,8 +5,10 @@
 - 解析Rust源代码文件，提取struct定义
 - 将Rust struct转换为TypeScript type定义
 - 支持基本类型转换（i32/i64/u32/u64/f32/f64/bool/String等）
-- 支持嵌套struct和Option类型
+- 支持嵌套struct（即struct的成员是另一个struct）
+- 支持Option类型
 - 支持Vec/Array类型
+- 支持HashMap类型，对应TypeScript的Record
 - 生成TypeScript代码并写入.ts文件
 
 ## 使用方式
@@ -36,7 +38,10 @@ cargo run -- <input.rs> <output.ts>
 - Option\<T\> → T | null
 - Vec\<T\> → T[]
 - Option\<Vec\<T\>\> → T[] | null
+- HashMap\<K, V\> → Record\<K, V\>
+- Option\<HashMap\<K, V\>\> → Record\<K, V\> | null
 - 自定义struct类型保持原名
+- 嵌套struct按相同规则处理
 
 ### 输入输出
 - 输入：.rs文件路径
