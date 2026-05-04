@@ -68,3 +68,23 @@ where
         }
     }
 }
+
+impl<K> PrefixCompletion<K> for SimplePrefixCompletion<K>
+where
+    K: Eq + Hash + Clone + ToString + Send + Sync  + 'static,
+{
+    fn complete(&self, prefix: &str) -> Vec<CompletionResult<K>> {
+        let mut results = Vec::new();
+        if let Some(map) = self.prefix_map.get(prefix) {
+            for entry in map.iter() {
+                for content in entry.value().iter() {
+                    results.push(CompletionResult {
+                        completion: content.clone(),
+                        key: entry.key().clone().into(),
+                    });
+                }
+            }
+        }
+        results
+    }
+}
