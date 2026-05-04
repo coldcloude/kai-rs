@@ -1,6 +1,6 @@
 use std::{collections::{HashMap, HashSet, LinkedList, hash_map::Entry}, hash::Hash, marker::PhantomData, ops::Range, rc::Rc};
 
-use crate::{Document, document::AsStr, index::{Index, IndexRemovable, IndexWithDetail, Split}, tokenizer::Tokenizer};
+use crate::{CompletionResult, Document, PrefixCompletion, document::AsStr, index::{Index, IndexRemovable, IndexWithDetail, Split}, tokenizer::Tokenizer};
 
 pub fn split<T>(tokens: &Vec<T>) -> Vec<Vec<Range<usize>>> {
     let mut result_splits: Vec<Vec<Range<usize>>> = Vec::new();
@@ -335,12 +335,19 @@ where
     TKNZ: Tokenizer<T>,
     IDX: IndexWithDetail<T,K>,
 {
-
     pub fn remove(&mut self, key: &K) {
         self.index.remove(key);
     }
+}
 
-    pub fn find_by_prefix(&self, prefix: &str) -> Vec<String> {
+impl<T,K,TKNZ,IDX> PrefixCompletion<K> for IndexSearch<T,K,TKNZ,IDX>
+where
+    T: Eq + Hash + Clone + 'static,
+    K: Eq + Hash + Clone + ToString + 'static,
+    TKNZ: Tokenizer<T>,
+    IDX: IndexWithDetail<T,K>,
+{
+    fn complete(&self, prefix: &str) -> Vec<CompletionResult<K>> {
         //找到前缀的所有结果和优先级
         let tokens = self.tokenizer.tokenize(prefix);
         let mut raw_result = self.index.find_detail(&tokens, true);
@@ -352,9 +359,13 @@ where
         let mut result = Vec::new();
         for (key, (_,mut index_map)) in priority_result.drain() {
             for (index, _) in index_map.drain() {
+                let key = key.clone();
                 if let Ok(tokens) = self.index.retrieve(&key, index) {
-                    if let Ok(content) = self.tokenizer.untokenize(tokens.as_slice()) {
-                        result.push(content);
+                    if let Ok(completion) = self.tokenizer.untokenize(tokens.as_slice()) {
+                        result.push(CompletionResult {
+                            completion,
+                            key,
+                        });
                     }
                 }
             }

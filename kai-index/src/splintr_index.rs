@@ -1,6 +1,6 @@
 use std::hash::Hash;
 
-use crate::{Document, atomic_index::AtomicIndex, document::AsStr, error::Result, index_search::IndexSearch, splintr_tokenizer::SplintrTokenizer};
+use crate::{PrefixCompletion, CompletionResult, Document, atomic_index::AtomicIndex, document::AsStr, error::Result, index_search::IndexSearch, splintr_tokenizer::SplintrTokenizer};
 
 pub struct SplintrIndex<K>
 where
@@ -36,7 +36,7 @@ where
         self.index_search.find_all_keys(query, split)
     }
 
-    pub fn find_by_prefix(&self, prefix: &str) -> Vec<String> {
-        self.index_search.find_by_prefix(prefix)
+    pub fn complete(&self, prefix: &str) -> Vec<CompletionResult<K>> {
+        self.index_search.complete(prefix)
     }
 }

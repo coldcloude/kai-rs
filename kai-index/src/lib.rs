@@ -10,6 +10,8 @@ pub mod simple_index;
 pub mod atomic_index;
 pub mod index_search;
 
+pub mod prefix_completion;
+
 pub mod substring_tokenizer;
 pub mod substring_index;
 pub mod splintr_tokenizer;
@@ -25,6 +27,9 @@ pub use atomic_index::AtomicIndex;
 pub use hierarchical_tree::HierarchicalTree;
 pub use simple_index::SimpleIndex;
 pub use distinct_index::{build_single_index, DistinctIndex};
+
+pub use prefix_completion::{PrefixCompletion, CompletionResult};
+
 pub use substring_tokenizer::SubstringTokenizer;
 pub use substring_index::SubstringIndex;
 pub use splintr_tokenizer::SplintrTokenizer;
