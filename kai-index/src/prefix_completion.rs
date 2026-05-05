@@ -3,6 +3,9 @@ use dashmap::{DashMap, DashSet};
 
 use crate::document::{AsStr, Document};
 
+use serde::{Deserialize, Serialize};
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CompletionResult<K>
 where
     K: Eq + Hash + Clone + ToString + 'static,
