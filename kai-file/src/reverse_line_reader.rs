@@ -1,141 +1,94 @@
+use std::collections::LinkedList;
+
 use tokio::fs::File;
 use tokio::io::{AsyncReadExt, AsyncSeekExt, SeekFrom};
-use crate::error::{Error, Result};
+use crate::error::Result;
 
 const BUFFER_SIZE: usize = 4096;
 
 pub struct ReverseLineReader {
     file: File,
-    file_size: u64,
     current_pos: u64,
     buffer: Vec<u8>,
-    buffer_start: usize,
     buffer_end: usize,
-    leftover: Vec<u8>,
+    splits: LinkedList<Vec<u8>>,
 }
 
 impl ReverseLineReader {
     pub async fn new(path: impl AsRef<std::path::Path>) -> Result<Self> {
         let mut file = File::open(path).await?;
         let file_size = file.seek(SeekFrom::End(0)).await?;
-        let mut current_pos = file_size;
-
-        // 只有文件不为空时才考虑是否忽略结尾换行符
-        if file_size > 0 {
-            let mut is_only_newlines = true;
-            let mut buffer = vec![0u8; std::cmp::min(BUFFER_SIZE, file_size as usize)];
-            let mut pos = 0;
-            
-            // 检查文件是否只包含换行符
-            while pos < file_size {
-                let read_len = std::cmp::min(buffer.len(), (file_size - pos) as usize);
-                file.seek(SeekFrom::Start(pos)).await?;
-                file.read_exact(&mut buffer[..read_len]).await?;
-                
-                for &byte in &buffer[..read_len] {
-                    if byte != b'\n' && byte != b'\r' {
-                        is_only_newlines = false;
-                        break;
-                    }
-                }
-                
-                if !is_only_newlines {
-                    break;
-                }
-                
-                pos += read_len as u64;
-            }
-            
-            // 只有文件不全是换行符时，才忽略结尾的一个换行符
-            if !is_only_newlines {
-                let mut temp_buffer = [0u8; 2];
-                let check_len = std::cmp::min(2, file_size as usize);
-                let check_pos = file_size - check_len as u64;
-                
-                file.seek(SeekFrom::Start(check_pos)).await?;
-                file.read_exact(&mut temp_buffer[..check_len]).await?;
-                
-                // 检查是否以\n结尾
-                if temp_buffer[check_len - 1] == b'\n' {
-                    if check_len >= 2 && temp_buffer[check_len - 2] == b'\r' {
-                        // 以\r\n结尾，跳过两个字符
-                        current_pos -= 2;
-                    } else {
-                        // 以\n结尾，跳过一个字符
-                        current_pos -= 1;
-                    }
-                }
-            }
-        }
 
         Ok(Self {
             file,
-            file_size,
-            current_pos,
+            current_pos: file_size,
             buffer: vec![0; BUFFER_SIZE],
-            buffer_start: 0,
             buffer_end: 0,
-            leftover: Vec::new(),
+            splits: LinkedList::new(),
         })
+    }
+
+    fn save_buffer(&mut self, start: usize, end: usize) {
+        self.splits.push_front(self.buffer[start..end].to_vec());
+    }
+
+    fn pop_line_without_newline(&mut self) -> Result<Option<String>> {
+        if self.splits.is_empty() {
+            return Ok(None);
+        }
+        else {
+            //计算总长
+            let mut len = 0 as usize;
+            for split in self.splits.iter_mut() {
+                len += split.len();
+            }
+            //填入字节
+            let mut line = Vec::with_capacity(len);
+            while let Some(split) = self.splits.pop_front() {
+                //最后一个split移除结尾换行符
+                let mut end = split.len();
+                if self.splits.is_empty() {
+                    if end > 0 && split[end - 1] == b'\n' {
+                        end -= 1;
+                        if end > 0 && split[end - 1] == b'\r' {
+                            end -= 1;
+                        }
+                    }
+                }
+                line.extend_from_slice(&split[..end]);
+            }
+            let result = String::from_utf8(line)?;
+            Ok(Some(result))
+        }
     }
 
     pub async fn next_line(&mut self) -> Result<Option<String>> {
         loop {
-            for i in (self.buffer_start..self.buffer_end).rev() {
+            //搜索buffer，先跳过结尾\n后再搜索前一个\n
+            let search_end = if self.splits.is_empty() && self.buffer_end > 0 && self.buffer[self.buffer_end - 1] == b'\n' { self.buffer_end - 1 } else { self.buffer_end };
+            for i in (0..search_end).rev() {
                 if self.buffer[i] == b'\n' {
-                    let line_start = i + 1;
-                    let line_end = self.buffer_end;
-
-                    let mut line = Vec::with_capacity(self.leftover.len() + (line_end - line_start));
-                    line.extend_from_slice(&self.buffer[line_start..line_end]);
-                    line.extend_from_slice(&self.leftover);
-
-                    self.leftover.clear();
-                    self.buffer_end = i;
-
-                    if !line.is_empty() && line[line.len() - 1] == b'\r' {
-                        line.pop();
-                    }
-
-                    return Ok(Some(String::from_utf8(line)?));
+                    self.save_buffer(i + 1, self.buffer_end);
+                    self.buffer_end = i + 1;
+                    let line = self.pop_line_without_newline()?;
+                    return Ok(line);
                 }
             }
 
+            //buffer已搜索完，文件到达开头，输出剩余buffer
             if self.current_pos == 0 {
-                if !self.buffer.is_empty() && self.buffer_start < self.buffer_end {
-                    let mut line = Vec::with_capacity(self.leftover.len() + (self.buffer_end - self.buffer_start));
-                    line.extend_from_slice(&self.buffer[self.buffer_start..self.buffer_end]);
-                    line.extend_from_slice(&self.leftover);
-                    self.leftover.clear();
-                    self.buffer_end = self.buffer_start;
-
-                    if !line.is_empty() && line[line.len() - 1] == b'\r' {
-                        line.pop();
-                    }
-
-                    return Ok(Some(String::from_utf8(line)?));
-                } else if !self.leftover.is_empty() {
-                    let mut line = std::mem::take(&mut self.leftover);
-
-                    if !line.is_empty() && line[line.len() - 1] == b'\r' {
-                        line.pop();
-                    }
-
-                    return Ok(Some(String::from_utf8(line)?));
-                } else {
-                    return Ok(None);
+                if self.buffer_end > 0 {
+                    self.save_buffer(0, self.buffer_end);
                 }
+                self.buffer_end = 0;
+                return self.pop_line_without_newline();
             }
 
-            self.leftover.splice(0..0, self.buffer[self.buffer_start..self.buffer_end].iter().cloned());
-
+            //buffer已搜索完，继续读取文件
             let read_len = std::cmp::min(BUFFER_SIZE, self.current_pos as usize);
             self.current_pos -= read_len as u64;
-
             self.file.seek(SeekFrom::Start(self.current_pos)).await?;
             self.file.read_exact(&mut self.buffer[..read_len]).await?;
-
-            self.buffer_start = 0;
             self.buffer_end = read_len;
         }
     }
