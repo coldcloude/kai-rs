@@ -20,23 +20,50 @@ impl ReverseLineReader {
         let file_size = file.seek(SeekFrom::End(0)).await?;
         let mut current_pos = file_size;
 
-        // 忽略文件结尾的一个换行符
+        // 只有文件不为空时才考虑是否忽略结尾换行符
         if file_size > 0 {
-            let mut temp_buffer = [0u8; 2];
-            let check_len = std::cmp::min(2, file_size as usize);
-            let check_pos = file_size - check_len as u64;
+            let mut is_only_newlines = true;
+            let mut buffer = vec![0u8; std::cmp::min(BUFFER_SIZE, file_size as usize)];
+            let mut pos = 0;
             
-            file.seek(SeekFrom::Start(check_pos)).await?;
-            file.read_exact(&mut temp_buffer[..check_len]).await?;
+            // 检查文件是否只包含换行符
+            while pos < file_size {
+                let read_len = std::cmp::min(buffer.len(), (file_size - pos) as usize);
+                file.seek(SeekFrom::Start(pos)).await?;
+                file.read_exact(&mut buffer[..read_len]).await?;
+                
+                for &byte in &buffer[..read_len] {
+                    if byte != b'\n' && byte != b'\r' {
+                        is_only_newlines = false;
+                        break;
+                    }
+                }
+                
+                if !is_only_newlines {
+                    break;
+                }
+                
+                pos += read_len as u64;
+            }
             
-            // 检查是否以\n结尾
-            if temp_buffer[check_len - 1] == b'\n' {
-                if check_len >= 2 && temp_buffer[check_len - 2] == b'\r' {
-                    // 以\r\n结尾，跳过两个字符
-                    current_pos -= 2;
-                } else {
-                    // 以\n结尾，跳过一个字符
-                    current_pos -= 1;
+            // 只有文件不全是换行符时，才忽略结尾的一个换行符
+            if !is_only_newlines {
+                let mut temp_buffer = [0u8; 2];
+                let check_len = std::cmp::min(2, file_size as usize);
+                let check_pos = file_size - check_len as u64;
+                
+                file.seek(SeekFrom::Start(check_pos)).await?;
+                file.read_exact(&mut temp_buffer[..check_len]).await?;
+                
+                // 检查是否以\n结尾
+                if temp_buffer[check_len - 1] == b'\n' {
+                    if check_len >= 2 && temp_buffer[check_len - 2] == b'\r' {
+                        // 以\r\n结尾，跳过两个字符
+                        current_pos -= 2;
+                    } else {
+                        // 以\n结尾，跳过一个字符
+                        current_pos -= 1;
+                    }
                 }
             }
         }
@@ -259,6 +286,7 @@ mod tests {
         file.write_all(b"\n").await.unwrap();
 
         let mut reader = ReverseLineReader::new(&file_path).await.unwrap();
+        assert_eq!(reader.next_line().await.unwrap(), Some("".to_string()));
         assert_eq!(reader.next_line().await.unwrap(), None);
     }
 
@@ -271,6 +299,35 @@ mod tests {
         file.write_all(b"\r\n").await.unwrap();
 
         let mut reader = ReverseLineReader::new(&file_path).await.unwrap();
+        assert_eq!(reader.next_line().await.unwrap(), Some("".to_string()));
+        assert_eq!(reader.next_line().await.unwrap(), None);
+    }
+
+    #[tokio::test]
+    async fn test_only_two_newlines() {
+        let dir = tempdir().unwrap();
+        let file_path = dir.path().join("only_two_newlines.txt");
+
+        let mut file = File::create(&file_path).await.unwrap();
+        file.write_all(b"\n\n").await.unwrap();
+
+        let mut reader = ReverseLineReader::new(&file_path).await.unwrap();
+        assert_eq!(reader.next_line().await.unwrap(), Some("".to_string()));
+        assert_eq!(reader.next_line().await.unwrap(), Some("".to_string()));
+        assert_eq!(reader.next_line().await.unwrap(), None);
+    }
+
+    #[tokio::test]
+    async fn test_only_two_crlfs() {
+        let dir = tempdir().unwrap();
+        let file_path = dir.path().join("only_two_crlfs.txt");
+
+        let mut file = File::create(&file_path).await.unwrap();
+        file.write_all(b"\r\n\r\n").await.unwrap();
+
+        let mut reader = ReverseLineReader::new(&file_path).await.unwrap();
+        assert_eq!(reader.next_line().await.unwrap(), Some("".to_string()));
+        assert_eq!(reader.next_line().await.unwrap(), Some("".to_string()));
         assert_eq!(reader.next_line().await.unwrap(), None);
     }
 
