@@ -1,0 +1,15 @@
+[package]
+name = "kai-ws"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+async-trait = "0.1"
+tokio = { version = "1.0", features = ["full"] }
+tokio-tungstenite = "0.26"
+futures-util = "0.3"
+thiserror = "1.0"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+bytes = "1.11"
+velocityx = "0.4"
