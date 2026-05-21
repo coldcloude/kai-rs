@@ -1,5 +1,7 @@
 use thiserror::Error;
 
+use crate::WsMessageUnion;
+
 #[derive(Error, Debug)]
 pub enum Error {
     #[error("bin parse error: {0}")]
@@ -10,6 +12,9 @@ pub enum Error {
 
     #[error("json error error: {0}")]
     Json(#[from] serde_json::Error),
+
+    #[error("send error: {0}")]
+    Send(#[from] flume::SendError<WsMessageUnion>),
 }
 
 pub type Result<T> = std::result::Result<T, Error>;

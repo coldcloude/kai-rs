@@ -12,4 +12,6 @@ thiserror = "1.0"
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 bytes = "1.11"
-velocityx = "0.4"
+dashmap = "6.1"
+flume = "0.12"
+tracing = "0.1"
