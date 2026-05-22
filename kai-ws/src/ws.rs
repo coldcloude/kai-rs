@@ -31,6 +31,11 @@ pub trait WsJsonProcessor: Send + Sync + 'static {
     async fn process_json(&self, data: serde_json::Value, context: Arc<WsContext>) -> Result<()>;
 }
 
+#[async_trait]
+pub trait WsCloseProcessor: Send + Sync + 'static {
+    async fn process_close(&self, context: Arc<WsContext>) -> Result<()>;
+}
+
 pub const OFFSET_SN: usize = 0;
 pub const LEN_SN: usize = 4;
 
@@ -107,6 +112,7 @@ impl WsContext {
 pub struct WsMessageDispatcher {
     request_bin_processor_map: DashMap<u32, Arc<dyn WsBinaryProcessor>>,
     request_json_processor_map: DashMap<u32, Arc<dyn WsJsonProcessor>>,
+    close_processor: Option<Arc<dyn WsCloseProcessor>>,
 }
 
 impl WsMessageDispatcher {
@@ -114,6 +120,7 @@ impl WsMessageDispatcher {
         Self {
             request_bin_processor_map: DashMap::new(),
             request_json_processor_map: DashMap::new(),
+            close_processor: None,
         }
     }
 
@@ -210,7 +217,17 @@ impl WsMessageDispatcher {
                     break;
                 }
             }
-            recv_running.store(false, Ordering::Relaxed);
+            if let Ok(true) = recv_running.compare_exchange(true, false, Ordering::Relaxed, Ordering::Relaxed) {
+                if let Some(processor) = dispatcher.close_processor.clone() {
+                    tokio::spawn(async move {
+                        let span = span!(Level::INFO, "ws processing close");
+                        let _enter = span.enter();
+                        if let Err(e) = processor.process_close(recv_ctx).await {
+                            error!("Error processing close: {:?}", e);
+                        }
+                    });
+                }
+            }
         });
         tokio::task::spawn(async move {
             let span = span!(Level::INFO, "ws sending process");
