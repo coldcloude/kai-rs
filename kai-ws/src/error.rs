@@ -15,6 +15,9 @@ pub enum Error {
 
     #[error("send error: {0}")]
     Send(#[from] flume::SendError<WsMessageUnion>),
+
+    #[error("heartbeat handler already started")]
+    HeartbeatHandlerAlreadyStarted,
 }
 
 pub type Result<T> = std::result::Result<T, Error>;
