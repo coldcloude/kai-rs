@@ -1,4 +1,4 @@
-use std::{sync::{Arc, atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering}}};
+use std::sync::{Arc, RwLock, atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering}};
 
 use async_trait::async_trait;
 use dashmap::DashMap;
@@ -65,7 +65,7 @@ pub struct WsContext {
     sending_queue: (Sender<WsMessageUnion>, Receiver<WsMessageUnion>),
     request_bin_processor_map: DashMap<u32, Arc<dyn WsBinaryProcessor>>,
     request_json_processor_map: DashMap<u32, Arc<dyn WsJsonProcessor>>,
-    close_processor: Option<Arc<dyn WsCloseProcessor>>,
+    close_processor: Arc<RwLock<Option<Arc<dyn WsCloseProcessor>>>>,
     reponse_bin_processor_map: DashMap<u32, Arc<dyn WsBinaryProcessor>>,
     reponse_json_processor_map: DashMap<u32, Arc<dyn WsJsonProcessor>>,
 }
@@ -77,7 +77,7 @@ impl WsContext {
             sending_queue: bounded::<WsMessageUnion>(capacity),
             request_bin_processor_map: DashMap::new(),
             request_json_processor_map: DashMap::new(),
-            close_processor: None,
+            close_processor: Arc::new(RwLock::new(None)),
             reponse_bin_processor_map: DashMap::new(),
             reponse_json_processor_map: DashMap::new(),
         }
@@ -93,6 +93,12 @@ impl WsContext {
 
     pub fn set_json_processor(&self, payload_type: u32, processor: Arc<dyn WsJsonProcessor>) {
         self.request_json_processor_map.insert(payload_type, processor);
+    }
+
+    pub fn set_close_processor(&self, processor: Arc<dyn WsCloseProcessor>) {
+        if let Ok(mut guard) = self.close_processor.write() {
+            *guard = Some(processor);
+        }
     }
 
     pub fn send_json(&self, msg: WsMessage) -> Result<()> {
@@ -132,18 +138,18 @@ impl WsContext {
 }
 
 #[async_trait]
-pub trait WsProcessorInitializer<R>: Send + Sync {
-    async fn init(&mut self, context: Arc<WsContext>) -> Result<R>;
+pub trait WsProcessorInitializer<P>: Send + Sync {
+    async fn init(&self, ws_context: Arc<WsContext>, processor_context: Arc<P>) -> Result<()>;
 }
 
-pub async fn ws_handle_connection<I, R>(stream: TcpStream, initializer: &mut I, queue_capacity: usize) -> Result<R>
+pub async fn ws_handle_connection<I, P>(stream: TcpStream, queue_capacity: usize, processor_context: Arc<P>, initializer: &I) -> Result<()>
 where
-    I: WsProcessorInitializer<R>,
+    I: WsProcessorInitializer<P>,
 {
     let ws_stream = accept_async(stream).await?;
     let (mut sender, mut receiver) = ws_stream.split();
     let context = Arc::new(WsContext::new(queue_capacity));
-    let rr = initializer.init(context.clone()).await?;
+    initializer.init(context.clone(), processor_context).await?;
     let recv_ctx = context.clone();
     let send_ctx = context.clone();
     let recv_running = Arc::new(AtomicBool::new(true));
@@ -225,8 +231,19 @@ where
                 break;
             }
         }
+        //处理关闭回调
         if let Ok(true) = recv_running.compare_exchange(true, false, Ordering::Relaxed, Ordering::Relaxed) {
-            if let Some(processor) = recv_ctx.close_processor.clone() {
+            //获取回调
+            let processor = {
+                if let Ok(guard) = recv_ctx.close_processor.read() {
+                    guard.clone()
+                }
+                else {
+                    None
+                }
+            };
+            //执行回调
+            if let Some(processor) = processor {
                 tokio::spawn(async move {
                     let span = span!(Level::INFO, "ws processing close");
                     let _enter = span.enter();
@@ -276,7 +293,7 @@ where
             }
         }
     });
-    Ok(rr)
+    Ok(())
 }
 
 pub struct WsHeartbeatHandler {
