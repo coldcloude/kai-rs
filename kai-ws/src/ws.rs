@@ -16,26 +16,30 @@ pub const TYPE_RESPONSE: u32 = 0x00000000;
 
 pub const TYPE_HEARTBEAT: u32 = 0x00000000;
 
+pub const CODE_SUCCESS: u32 = 200;
+pub const CODE_ERROR: u32 = 500;
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct WsMessage {
     pub sn: u32,
     pub payload_type: u32,
-    pub payload: serde_json::Value,
+    pub status_code: u32,
+    pub payload: Option<serde_json::Value>,
 }
 
 #[async_trait]
 pub trait WsBinaryProcessor: Send + Sync + 'static {
-    async fn process_bin(&self, data: &[u8], context: Arc<WsContext>) -> Result<()>;
+    async fn process_bin(&self, data: &[u8], context: Arc<WsContext>);
 }
 
 #[async_trait]
 pub trait WsJsonProcessor: Send + Sync + 'static {
-    async fn process_json(&self, data: serde_json::Value, context: Arc<WsContext>) -> Result<()>;
+    async fn process_json(&self, data: WsMessage, context: Arc<WsContext>);
 }
 
 #[async_trait]
 pub trait WsCloseProcessor: Send + Sync + 'static {
-    async fn process_close(&self, context: Arc<WsContext>) -> Result<()>;
+    async fn process_close(&self, context: Arc<WsContext>);
 }
 
 pub const OFFSET_SN: usize = 0;
@@ -43,6 +47,9 @@ pub const LEN_SN: usize = 4;
 
 pub const OFFSET_PAYLOAD_TYPE: usize = OFFSET_SN + LEN_SN;
 pub const LEN_PAYLOAD_TYPE: usize = 4;
+
+pub const OFFSET_STATUS_CODE: usize = OFFSET_PAYLOAD_TYPE + LEN_PAYLOAD_TYPE;
+pub const LEN_STATUS_CODE: usize = 4;
 
 pub fn parse_bin_sn(data: &[u8]) -> Result<u32> {
     let sn_bin: [u8; 4] = data[OFFSET_SN..OFFSET_SN + LEN_SN].try_into()?;
@@ -52,6 +59,11 @@ pub fn parse_bin_sn(data: &[u8]) -> Result<u32> {
 pub fn parse_bin_payload_type(data: &[u8]) -> Result<u32> {
     let type_bin: [u8; 4] = data[OFFSET_PAYLOAD_TYPE..OFFSET_PAYLOAD_TYPE + LEN_PAYLOAD_TYPE].try_into()?;
     Ok(u32::from_be_bytes(type_bin))
+}
+
+pub fn parse_bin_status_code(data: &[u8]) -> Result<u32> {
+    let code_bin: [u8; 4] = data[OFFSET_STATUS_CODE..OFFSET_STATUS_CODE + LEN_STATUS_CODE].try_into()?;
+    Ok(u32::from_be_bytes(code_bin))
 }
 
 pub enum WsMessageUnion {
@@ -150,146 +162,145 @@ where
     let (mut sender, mut receiver) = ws_stream.split();
     let context = Arc::new(WsContext::new(queue_capacity));
     initializer.init(context.clone(), processor_context).await?;
+
     let recv_ctx = context.clone();
     let send_ctx = context.clone();
+    let close_ctx = context.clone();
     let recv_running = Arc::new(AtomicBool::new(true));
     let send_running = recv_running.clone();
+
+    //处理消息接收
     tokio::spawn(async move {
         let span = span!(Level::INFO, "ws receiving process");
         let _enter = span.enter();
         while let Some(msg) = receiver.next().await {
-            let mut result = Ok(());
-            match msg {
+            let msg = match msg {
                 Ok(msg) => {
-                    match msg {
-                        Message::Text(json) => {
-                            match serde_json::from_str::<WsMessage>(&json) {
-                                Ok(message) => {
-                                    let processor = if message.payload_type == TYPE_RESPONSE {
-                                        recv_ctx.reponse_json_processor_map.get(&message.sn)
-                                    } else {
-                                        recv_ctx.request_json_processor_map.get(&message.payload_type)
-                                    };
-                                    if let Some(processor) = processor {
-                                        let proc = processor.clone();
-                                        let ctx = recv_ctx.clone();
-                                        tokio::spawn(async move {
-                                            let span = span!(Level::INFO, "ws processing JSON message");
-                                            let _enter = span.enter();
-                                            if let Err(e) = proc.process_json(message.payload, ctx).await {
-                                                error!("Error processing JSON message: {:?}", e);
-                                            }
-                                        });
-                                    }
-                                },
-                                Err(e) => {
-                                    result = Err(Error::from(e));
-                                }
-                            };
-                        }
-                        Message::Binary(data) => {
-                            match parse_bin_sn(data.as_ref()) {
-                                Ok(sn) => {
-                                    match parse_bin_payload_type(data.as_ref()) {
-                                        Ok(payload_type) => {
-                                            let processor = if payload_type == TYPE_RESPONSE {
-                                                recv_ctx.reponse_bin_processor_map.get(&sn)
-                                            } else {
-                                                recv_ctx.request_bin_processor_map.get(&payload_type)
-                                            };
-                                            if let Some(processor) = processor {
-                                                let proc = processor.clone();
-                                                let ctx = recv_ctx.clone();
-                                                tokio::spawn(async move {
-                                                    let span = span!(Level::INFO, "ws processing binary message");
-                                                    let _enter = span.enter();
-                                                    if let Err(e) = proc.process_bin(data.as_ref(), ctx).await {
-                                                        error!("Error processing binary message: {:?}", e);
-                                                    }
-                                                });
-                                            }
-                                        },
-                                        Err(e) => {
-                                            result = Err(e);
-                                        }
-                                    };
-                                },
-                                Err(e) => {
-                                    result = Err(e);
-                                }
-                            }
-                        }
-                        _ => {}
-                    }
+                    msg
                 }
                 Err(e) => {
-                    result = Err(Error::from(e));
-                }
-            }
-            if let Err(e) = result {
-                error!("Error receiving message: {:?}", e);
-                break;
-            }
-        }
-        //处理关闭回调
-        if let Ok(true) = recv_running.compare_exchange(true, false, Ordering::Relaxed, Ordering::Relaxed) {
-            //获取回调
-            let processor = {
-                if let Ok(guard) = recv_ctx.close_processor.read() {
-                    guard.clone()
-                }
-                else {
-                    None
+                    error!("Error receiving message: {:?}", e);
+                    continue;
                 }
             };
-            //执行回调
-            if let Some(processor) = processor {
-                tokio::spawn(async move {
-                    let span = span!(Level::INFO, "ws processing close");
-                    let _enter = span.enter();
-                    if let Err(e) = processor.process_close(recv_ctx).await {
-                        error!("Error processing close: {:?}", e);
-                    }
-                });
+            match msg {
+                Message::Text(json) => {
+                    let message = match serde_json::from_str::<WsMessage>(&json) {
+                        Ok(message) => {
+                            message
+                        },
+                        Err(e) => {
+                            error!("Error parsing json message: {:?}", e);
+                            continue;
+                        }
+                    };
+                    let processor = if message.payload_type == TYPE_RESPONSE {
+                        recv_ctx.reponse_json_processor_map.get(&message.sn)
+                    } else {
+                        recv_ctx.request_json_processor_map.get(&message.payload_type)
+                    };
+                    let Some(processor) = processor else {
+                        continue;
+                    };
+                    let proc = processor.clone();
+                    let ctx = recv_ctx.clone();
+                    tokio::spawn(async move {
+                        proc.process_json(message, ctx).await;
+                    });
+                }
+                Message::Binary(data) => {
+                    let sn = match parse_bin_sn(data.as_ref()) {
+                        Ok(sn) => {
+                            sn
+                        },
+                        Err(e) => {
+                            error!("Error parsing binary payload sn: {:?}", e);
+                            continue;
+                        }
+                    };
+                    let payload_type = match parse_bin_payload_type(data.as_ref()) {
+                        Ok(payload_type) => {
+                            payload_type
+                        },
+                        Err(e) => {
+                            error!("Error parsing binary payload type: {:?}", e);
+                            continue;
+                        }
+                    };
+                    let processor = if payload_type == TYPE_RESPONSE {
+                        recv_ctx.reponse_bin_processor_map.get(&sn)
+                    } else {
+                        recv_ctx.request_bin_processor_map.get(&payload_type)
+                    };
+                    let Some(processor) = processor else {
+                        continue;
+                    };
+                    let proc = processor.clone();
+                    let ctx = recv_ctx.clone();
+                    tokio::spawn(async move {
+                        proc.process_bin(data.as_ref(), ctx).await;
+                    });
+                }
+                Message::Close(_) => {
+                    break;
+                }
+                _ => {}
             }
         }
+
+        //处理关闭回调
+        let Err(_) = recv_running.compare_exchange(true, false, Ordering::Relaxed, Ordering::Relaxed) else {
+            return;
+        };
+        //获取关闭回调
+        let Ok(guard) = recv_ctx.close_processor.read() else {
+            return;
+        };
+        let Some(processor) = guard.clone() else {
+            return;
+        };
+        //执行关闭回调
+        tokio::spawn(async move {
+            processor.process_close(close_ctx).await;
+        });
     });
+
+    //处理消息发送
     tokio::task::spawn(async move {
         let span = span!(Level::INFO, "ws sending process");
         let _enter = span.enter();
         while send_running.load(Ordering::Relaxed) {
-            let result = send_ctx.sending_queue.1.recv_async().await;
-            if let Ok(msg) = result {
-                let mut result = Ok(());
-                match msg {
-                    WsMessageUnion::Json(msg) => {
-                        match serde_json::to_string(&msg) {
-                            Ok(json) => {
-                                if let Err(e) = sender.send(Message::text(json)).await {
-                                    result = Err(Error::from(e));
-                                }
-                            },
-                            Err(e) => {
-                                result = Err(Error::from(e));
-                            }
-                        }
-                    }
-                    WsMessageUnion::Binary(msg) => {
-                        if let Err(e) = sender.send(Message::binary(msg)).await {
-                            result = Err(Error::from(e));
-                        }
-                    }
-                    WsMessageUnion::Close => {
-                        break;
-                    }
-                }
-                if let Err(e) = result {
-                    error!("Error sending message: {:?}", e);
-                    break;
-                }
-            }
-            else {
+            let Ok(msg) = send_ctx.sending_queue.1.recv_async().await else {
                 break;
+            };
+            match msg {
+                WsMessageUnion::Json(msg) => {
+                    let json = match serde_json::to_string(&msg) {
+                        Ok(json) => {
+                            json
+                        },
+                        Err(e) => {
+                            error!("Error building json message: {:?}", e);
+                            continue;
+                        }
+                    };
+                    if let Err(e) = sender.send(Message::text(json)).await {
+                            error!("Error sending json message: {:?}", e);
+                            continue;
+                    }
+                }
+                WsMessageUnion::Binary(msg) => {
+                    if let Err(e) = sender.send(Message::binary(msg)).await {
+                        error!("Error sending binary message: {:?}", e);
+                        continue;
+                    }
+                }
+                WsMessageUnion::Close => {
+                    if let Err(e) = sender.send(Message::Close(None)).await {
+                        error!("Error sending close message: {:?}", e);
+                        continue;
+                    }
+                }
             }
         }
     });
@@ -344,56 +355,53 @@ impl WsHeartbeatHandler {
     }
 
     pub async fn start(&self) -> Result<()> {
-        if let Ok(_) = self.running.compare_exchange(false, true, Ordering::Relaxed, Ordering::Relaxed) {
-            self.update_deadline();
-            self.update_next_send();
-            while self.running.load(Ordering::Relaxed) {
-                let now = Instant::now();
-                //先处理超时关闭
-                let deadline = self.get_deadline();
-                if deadline < now {
-                    let span = span!(Level::INFO, "ws heartbeat timeout");
-                    let _enter = span.enter();
-                    self.running.store(false, Ordering::Relaxed);
-                    if let Err(e) = self.ws_context.send_close().await {
-                        error!("Error sending close: {:?}", e);
-                    }
-                    break;
+        if let Err(_) = self.running.compare_exchange(false, true, Ordering::Relaxed, Ordering::Relaxed) {
+            return Err(Error::HeartbeatHandlerAlreadyStarted);
+        }
+        self.update_deadline();
+        self.update_next_send();
+        while self.running.load(Ordering::Relaxed) {
+            let now = Instant::now();
+            //先处理超时关闭
+            let deadline = self.get_deadline();
+            if deadline < now {
+                let span = span!(Level::INFO, "ws heartbeat timeout");
+                let _enter = span.enter();
+                self.running.store(false, Ordering::Relaxed);
+                if let Err(e) = self.ws_context.send_close().await {
+                    error!("Error sending close: {:?}", e);
                 }
-                //再处理心跳发送
-                let next_send = self.get_next_send();
-                if next_send < now {
-                    let span = span!(Level::INFO, "ws heartbeat send");
-                    let _enter = span.enter();
-                    let mut buffer = BytesMut::new();
-                    let sn = self.ws_context.next_request_sn();
-                    buffer.put_u32(sn);
-                    buffer.put_u32(TYPE_HEARTBEAT);
-                    if let Err(e) = self.ws_context.send_bin(buffer.freeze()).await {
-                        error!("Error sending heartbeat: {:?}", e);
-                    }
-                    self.update_next_send();
-                }
-                //空闲至下次事件
-                let next_send = self.get_next_send();
-                let min_next_send = next_send.min(deadline);
-                tokio::time::sleep(min_next_send - now).await;
+                break;
             }
-            Ok(())
+            //再处理心跳发送
+            let next_send = self.get_next_send();
+            if next_send < now {
+                let span = span!(Level::INFO, "ws heartbeat send");
+                let _enter = span.enter();
+                let mut buffer = BytesMut::new();
+                let sn = self.ws_context.next_request_sn();
+                buffer.put_u32(sn);
+                buffer.put_u32(TYPE_HEARTBEAT);
+                if let Err(e) = self.ws_context.send_bin(buffer.freeze()).await {
+                    error!("Error sending heartbeat: {:?}", e);
+                }
+                self.update_next_send();
+            }
+            //空闲至下次事件
+            let next_send = self.get_next_send();
+            let min_next_send = next_send.min(deadline);
+            tokio::time::sleep(min_next_send - now).await;
         }
-        else {
-            Err(Error::HeartbeatHandlerAlreadyStarted)
-        }
+        Ok(())
     }
 }
 
 #[async_trait]
 impl WsBinaryProcessor for WsHeartbeatHandler {
     //收到数据后，更新timeout
-    async fn process_bin(&self, _: &[u8], _: Arc<WsContext>) -> Result<()> {
+    async fn process_bin(&self, _: &[u8], _: Arc<WsContext>) {
         if self.running.load(Ordering::Relaxed) {
             self.update_deadline();
         }
-        Ok(())
     }
 }

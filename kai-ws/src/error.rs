@@ -10,9 +10,6 @@ pub enum Error {
     #[error("ws error: {0}")]
     WebSocket(#[from] tokio_tungstenite::tungstenite::Error),
 
-    #[error("json error error: {0}")]
-    Json(#[from] serde_json::Error),
-
     #[error("send error: {0}")]
     Send(#[from] flume::SendError<WsMessageUnion>),
 
