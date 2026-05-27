@@ -101,38 +101,38 @@ impl WsContext {
         }
     }
 
-    pub fn send_json(&self, msg: WsMessage) -> Result<()> {
-        self.sending_queue.0.send(WsMessageUnion::Json(msg))?;
+    pub async fn send_json(&self, msg: WsMessage) -> Result<()> {
+        self.sending_queue.0.send_async(WsMessageUnion::Json(msg)).await?;
         Ok(())
     }
 
-    pub fn send_bin(&self, msg: Bytes) -> Result<()> {
-        self.sending_queue.0.send(WsMessageUnion::Binary(msg))?;
+    pub async fn send_bin(&self, msg: Bytes) -> Result<()> {
+        self.sending_queue.0.send_async(WsMessageUnion::Binary(msg)).await?;
         Ok(())
     }
 
-    pub fn send_json_with_json_response(&self, request: WsMessage, response_handler: Arc<dyn WsJsonProcessor>) -> Result<()> {
+    pub async fn send_json_with_json_response(&self, request: WsMessage, response_handler: Arc<dyn WsJsonProcessor>) -> Result<()> {
         self.reponse_json_processor_map.insert(request.sn, response_handler);
-        self.send_json(request)
+        self.send_json(request).await
     }
 
-    pub fn send_bin_with_json_response(&self, sn: u32, request: Bytes, response_handler: Arc<dyn WsJsonProcessor>) -> Result<()> {
+    pub async fn send_bin_with_json_response(&self, sn: u32, request: Bytes, response_handler: Arc<dyn WsJsonProcessor>) -> Result<()> {
         self.reponse_json_processor_map.insert(sn, response_handler);
-        self.send_bin(request)
+        self.send_bin(request).await
     }
 
-    pub fn send_json_with_bin_response(&self, request: WsMessage, response_handler: Arc<dyn WsBinaryProcessor>) -> Result<()> {
+    pub async fn send_json_with_bin_response(&self, request: WsMessage, response_handler: Arc<dyn WsBinaryProcessor>) -> Result<()> {
         self.reponse_bin_processor_map.insert(request.sn, response_handler);
-        self.send_json(request)
+        self.send_json(request).await
     }
 
-    pub fn send_bin_with_bin_response(&self, sn: u32, request: Bytes, response_handler: Arc<dyn WsBinaryProcessor>) -> Result<()> {
+    pub async fn send_bin_with_bin_response(&self, sn: u32, request: Bytes, response_handler: Arc<dyn WsBinaryProcessor>) -> Result<()> {
         self.reponse_bin_processor_map.insert(sn, response_handler);
-        self.send_bin(request)
+        self.send_bin(request).await
     }
 
     pub async fn send_close(&self) -> Result<()> {
-        self.sending_queue.0.send(WsMessageUnion::Close)?;
+        self.sending_queue.0.send_async(WsMessageUnion::Close).await?;
         Ok(())
     }
 }
@@ -369,7 +369,7 @@ impl WsHeartbeatHandler {
                     let sn = self.ws_context.next_request_sn();
                     buffer.put_u32(sn);
                     buffer.put_u32(TYPE_HEARTBEAT);
-                    if let Err(e) = self.ws_context.send_bin(buffer.freeze()) {
+                    if let Err(e) = self.ws_context.send_bin(buffer.freeze()).await {
                         error!("Error sending heartbeat: {:?}", e);
                     }
                     self.update_next_send();
