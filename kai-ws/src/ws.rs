@@ -6,7 +6,7 @@ use flume::{Receiver, Sender, bounded};
 use serde::{Deserialize, Serialize};
 use bytes::{BufMut, Bytes, BytesMut};
 use tokio::{net::TcpStream, time::{Duration, Instant}};
-use tokio_tungstenite::{accept_async, tungstenite::Message};
+use tokio_tungstenite::{accept_async, tungstenite::{Message, Utf8Bytes}};
 use futures_util::{SinkExt, StreamExt};
 use tracing::{Level, error, span};
 
@@ -154,6 +154,58 @@ pub trait WsProcessorInitializer<P>: Send + Sync {
     async fn init(&self, ws_context: Arc<WsContext>, processor_context: Arc<P>) -> Result<()>;
 }
 
+async fn ws_handle_json_message(json: Utf8Bytes, recv_ctx: Arc<WsContext>) -> Result<()> {
+    let message = serde_json::from_str::<WsMessage>(&json)?;
+    let processor = if message.payload_type == TYPE_RESPONSE {
+        recv_ctx.reponse_json_processor_map.get(&message.sn)
+    } else {
+        recv_ctx.request_json_processor_map.get(&message.payload_type)
+    };
+    if let Some(processor) = processor {
+        let proc = processor.clone();
+        let ctx = recv_ctx.clone();
+        tokio::spawn(async move {
+            proc.process_json(message, ctx).await;
+        });
+    }
+    Ok(())
+}
+
+async fn ws_handle_bin_message(data: Bytes, recv_ctx: Arc<WsContext>) -> Result<()> {
+    let sn = parse_bin_sn(data.as_ref())?;
+    let payload_type = parse_bin_payload_type(data.as_ref())?;
+    let processor = if payload_type == TYPE_RESPONSE {
+        recv_ctx.reponse_bin_processor_map.get(&sn)
+    } else {
+        recv_ctx.request_bin_processor_map.get(&payload_type)
+    };
+    if let Some(processor) = processor {
+        let proc = processor.clone();
+        let ctx = recv_ctx.clone();
+        tokio::spawn(async move {
+            proc.process_bin(data.as_ref(), ctx).await;
+        });
+    };
+    Ok(())
+}
+
+async fn ws_handle_close(recv_ctx: Arc<WsContext>) -> Result<()> {
+    //获取关闭回调
+    let processor = match recv_ctx.close_processor.read() {
+        Ok(guard) => guard.clone(),
+        Err(_) => None,
+    };
+    //执行关闭回调
+    if let Some(processor) = processor {
+        let ctx = recv_ctx.clone();
+        tokio::spawn(async move {
+            processor.process_close(ctx).await;
+        });
+    }
+    Ok(())
+}
+
+
 pub async fn ws_handle_connection<I, P>(stream: TcpStream, queue_capacity: usize, processor_context: Arc<P>, initializer: &I) -> Result<()>
 where
     I: WsProcessorInitializer<P>,
@@ -165,7 +217,6 @@ where
 
     let recv_ctx = context.clone();
     let send_ctx = context.clone();
-    let close_ctx = context.clone();
     let recv_running = Arc::new(AtomicBool::new(true));
     let send_running = recv_running.clone();
 
@@ -174,95 +225,36 @@ where
         let span = span!(Level::INFO, "ws receiving process");
         let _enter = span.enter();
         while let Some(msg) = receiver.next().await {
-            let msg = match msg {
+            match msg {
                 Ok(msg) => {
-                    msg
+                    match msg {
+                        Message::Text(json) => {
+                            if let Err(e) = ws_handle_json_message(json, recv_ctx.clone()).await {
+                                error!("Error handling json message: {:?}", e);
+                            }
+                        }
+                        Message::Binary(data) => {
+                            if let Err(e) = ws_handle_bin_message(data, recv_ctx.clone()).await {
+                                error!("Error handling bin message: {:?}", e);
+                            }
+                        }
+                        Message::Close(_) => {
+                            break;
+                        }
+                        _ => {}
+                    }
                 }
                 Err(e) => {
                     error!("Error receiving message: {:?}", e);
-                    continue;
                 }
             };
-            match msg {
-                Message::Text(json) => {
-                    let message = match serde_json::from_str::<WsMessage>(&json) {
-                        Ok(message) => {
-                            message
-                        },
-                        Err(e) => {
-                            error!("Error parsing json message: {:?}", e);
-                            continue;
-                        }
-                    };
-                    let processor = if message.payload_type == TYPE_RESPONSE {
-                        recv_ctx.reponse_json_processor_map.get(&message.sn)
-                    } else {
-                        recv_ctx.request_json_processor_map.get(&message.payload_type)
-                    };
-                    let Some(processor) = processor else {
-                        continue;
-                    };
-                    let proc = processor.clone();
-                    let ctx = recv_ctx.clone();
-                    tokio::spawn(async move {
-                        proc.process_json(message, ctx).await;
-                    });
-                }
-                Message::Binary(data) => {
-                    let sn = match parse_bin_sn(data.as_ref()) {
-                        Ok(sn) => {
-                            sn
-                        },
-                        Err(e) => {
-                            error!("Error parsing binary payload sn: {:?}", e);
-                            continue;
-                        }
-                    };
-                    let payload_type = match parse_bin_payload_type(data.as_ref()) {
-                        Ok(payload_type) => {
-                            payload_type
-                        },
-                        Err(e) => {
-                            error!("Error parsing binary payload type: {:?}", e);
-                            continue;
-                        }
-                    };
-                    let processor = if payload_type == TYPE_RESPONSE {
-                        recv_ctx.reponse_bin_processor_map.get(&sn)
-                    } else {
-                        recv_ctx.request_bin_processor_map.get(&payload_type)
-                    };
-                    let Some(processor) = processor else {
-                        continue;
-                    };
-                    let proc = processor.clone();
-                    let ctx = recv_ctx.clone();
-                    tokio::spawn(async move {
-                        proc.process_bin(data.as_ref(), ctx).await;
-                    });
-                }
-                Message::Close(_) => {
-                    break;
-                }
-                _ => {}
+        }
+        //处理关闭回调
+        if let Ok(true) = recv_running.compare_exchange(true, false, Ordering::Relaxed, Ordering::Relaxed) {
+            if let Err(e) = ws_handle_close(recv_ctx.clone()).await {
+                error!("Error handling close message: {:?}", e);
             }
         }
-
-        //处理关闭回调
-        let Err(_) = recv_running.compare_exchange(true, false, Ordering::Relaxed, Ordering::Relaxed) else {
-            return;
-        };
-        //获取关闭回调
-        let Ok(guard) = recv_ctx.close_processor.read() else {
-            return;
-        };
-        let Some(processor) = guard.clone() else {
-            return;
-        };
-        //执行关闭回调
-        tokio::spawn(async move {
-            processor.process_close(close_ctx).await;
-        });
     });
 
     //处理消息发送
@@ -275,30 +267,25 @@ where
             };
             match msg {
                 WsMessageUnion::Json(msg) => {
-                    let json = match serde_json::to_string(&msg) {
+                    match serde_json::to_string(&msg) {
                         Ok(json) => {
-                            json
+                            if let Err(e) = sender.send(Message::text(json)).await {
+                                error!("Error sending json message: {:?}", e);
+                            }
                         },
                         Err(e) => {
                             error!("Error building json message: {:?}", e);
-                            continue;
                         }
                     };
-                    if let Err(e) = sender.send(Message::text(json)).await {
-                            error!("Error sending json message: {:?}", e);
-                            continue;
-                    }
                 }
                 WsMessageUnion::Binary(msg) => {
                     if let Err(e) = sender.send(Message::binary(msg)).await {
                         error!("Error sending binary message: {:?}", e);
-                        continue;
                     }
                 }
                 WsMessageUnion::Close => {
                     if let Err(e) = sender.send(Message::Close(None)).await {
                         error!("Error sending close message: {:?}", e);
-                        continue;
                     }
                 }
             }
