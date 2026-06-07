@@ -18,6 +18,9 @@ pub enum Error {
 
     #[error("heartbeat handler already started")]
     HeartbeatHandlerAlreadyStarted,
+
+    #[error("wss upgrade rejected: {0}")]
+    UpgradeRejected(String),
 }
 
 pub type Result<T> = std::result::Result<T, Error>;

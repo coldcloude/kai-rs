@@ -6,7 +6,7 @@ use flume::{Receiver, Sender, bounded};
 use serde::{Deserialize, Serialize};
 use bytes::{BufMut, Bytes, BytesMut};
 use tokio::{net::TcpStream, time::{Duration, Instant}};
-use tokio_tungstenite::{accept_async, tungstenite::{Message, Utf8Bytes}};
+use tokio_tungstenite::{accept_async, accept_hdr_async, tungstenite::{Message, Utf8Bytes}};
 use futures_util::{SinkExt, StreamExt};
 use tracing::{Level, error, span};
 
@@ -154,6 +154,15 @@ pub trait WsProcessorInitializer<P>: Send + Sync {
     async fn init(&self, ws_context: Arc<WsContext>, processor_context: Arc<P>) -> Result<()>;
 }
 
+/// WSS 握手阶段请求头过滤器。
+/// 在 WebSocket Upgrade 完成后、WebSocket 流建立前调用。
+/// filter 接收 HTTP Request 的引用，可检查请求头。
+/// 返回 Ok(()) 表示通过，返回 Err 表示拒绝连接。
+/// 注意：此 trait 是同步的，因为 accept_hdr_async 的回调是同步闭包。
+pub trait WsHeaderFilter: Send + Sync {
+    fn filter(&self, request: &http::Request<()>) -> Result<()>;
+}
+
 async fn ws_handle_json_message(json: Utf8Bytes, recv_ctx: Arc<WsContext>) -> Result<()> {
     let message = serde_json::from_str::<WsMessage>(&json)?;
     let processor = if message.payload_type == TYPE_RESPONSE {
@@ -205,16 +214,29 @@ async fn ws_handle_close(recv_ctx: Arc<WsContext>) -> Result<()> {
     Ok(())
 }
 
-
-pub async fn ws_handle_connection<I, P>(stream: TcpStream, queue_capacity: usize, processor_context: Arc<P>, initializer: &I) -> Result<()>
+/// 建立 WebSocket 连接，在握手阶段使用 filter 对 HTTP 请求头进行校验。
+/// filter 按顺序执行，全部通过才建立连接；任一 filter 拒绝则连接关闭。
+pub async fn ws_handle_connection_with_filter<I, P>(stream: TcpStream, queue_capacity: usize, processor_context: Arc<P>, initializer: &I, filters: &[&dyn WsHeaderFilter]) -> Result<()>
 where
     I: WsProcessorInitializer<P>,
 {
-    let ws_stream = accept_async(stream).await?;
-    let (mut sender, mut receiver) = ws_stream.split();
+    let ws_stream = if !filters.is_empty() {
+        accept_hdr_async(stream, |request: &http::Request<()>, response: http::Response<()>| {
+            for filter in filters {
+                if let Err(e) = filter.filter(request) {
+                    let mut err_response = http::Response::new(Some(e.to_string()));
+                    *err_response.status_mut() = http::StatusCode::UNAUTHORIZED;
+                    return Err(err_response);
+                }
+            }
+            Ok(response)
+        }).await?
+    } else {
+        accept_async(stream).await?
+    };
     let context = Arc::new(WsContext::new(queue_capacity));
     initializer.init(context.clone(), processor_context).await?;
-
+    let (mut sender, mut receiver) = ws_stream.split();
     let recv_ctx = context.clone();
     let send_ctx = context.clone();
     let recv_running = Arc::new(AtomicBool::new(true));
@@ -292,6 +314,14 @@ where
         }
     });
     Ok(())
+}
+
+/// 建立 WebSocket 连接，不使用请求头过滤。
+pub async fn ws_handle_connection<I, P>(stream: TcpStream, queue_capacity: usize, processor_context: Arc<P>, initializer: &I) -> Result<()>
+where
+    I: WsProcessorInitializer<P>,
+{
+    ws_handle_connection_with_filter(stream, queue_capacity, processor_context, initializer, &[]).await
 }
 
 pub struct WsHeartbeatHandler {
