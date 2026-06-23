@@ -78,6 +78,7 @@ pub fn parse_bin_status_code(data: &[u8]) -> Result<u32> {
     Ok(u32::from_be_bytes(code_bin))
 }
 
+#[derive(Debug)]
 pub enum WsMessageUnion {
     Json(WsMessage),
     Binary(Bytes),
@@ -440,6 +441,7 @@ mod tests {
     use std::sync::{Arc, Mutex};
     use std::sync::atomic::{AtomicBool, Ordering};
     use bytes::Bytes;
+    use tokio::time::Duration;
     use super::*;
 
     // Mock processor for JSON messages - records invocations
@@ -784,5 +786,111 @@ mod tests {
         let data = Bytes::from(make_bin_header(1, 999, 200));
         let result = ws_handle_bin_message(data, ctx.clone()).await;
         assert!(result.is_ok());
+    }
+
+    // === Group 5: WsHeartbeatHandler integration tests ===
+    // All use 1-second interval, wrapped in tokio::time::timeout
+    // to prevent hanging.
+
+    #[tokio::test]
+    async fn test_heartbeat_send() {
+        let ctx = Arc::new(WsContext::new(16));
+        let handler = Arc::new(WsHeartbeatHandler::new(Duration::from_secs(1), ctx.clone()));
+
+        tokio::time::timeout(Duration::from_secs(5), async {
+            // Start heartbeat in a background task
+            let h = handler.clone();
+            tokio::spawn(async move {
+                let _ = h.start().await;
+            });
+
+            // Receive from queue - should get a heartbeat within ~1.1s
+            tokio::time::sleep(Duration::from_millis(1100)).await;
+            let received = ctx.sending_queue.1.try_recv();
+
+            // Stop the heartbeat
+            handler.running.store(false, Ordering::Relaxed);
+
+            match received {
+                Ok(WsMessageUnion::Binary(data)) => {
+                    let sn = parse_bin_sn(&data).unwrap();
+                    let pt = parse_bin_payload_type(&data).unwrap();
+                    assert_eq!(pt, TYPE_HEARTBEAT, "payload_type should be TYPE_HEARTBEAT");
+                    assert!(sn <= 1, "sn should be 0 or 1");
+                },
+                other => panic!("expected Binary heartbeat, got {:?}", other),
+            }
+        }).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_heartbeat_refresh() {
+        let ctx = Arc::new(WsContext::new(16));
+        let handler = Arc::new(WsHeartbeatHandler::new(Duration::from_secs(1), ctx.clone()));
+
+        tokio::time::timeout(Duration::from_secs(8), async {
+            let h = handler.clone();
+            tokio::spawn(async move {
+                let _ = h.start().await;
+            });
+
+            // Feed data periodically to refresh deadline
+            for _ in 0..4 {
+                tokio::time::sleep(Duration::from_millis(500)).await;
+                handler.process_bin(&[0u8; 12], ctx.clone()).await;
+            }
+
+            // After ~2s with refreshes, no close should have been sent
+            // Drain any heartbeat messages
+            while ctx.sending_queue.1.try_recv().is_ok() {}
+
+            // Give more time - if deadline wasn't refreshed, close would be sent
+            tokio::time::sleep(Duration::from_secs(2)).await;
+            let result = ctx.sending_queue.1.try_recv();
+            // We may get a heartbeat or nothing; we should NOT get a Close
+            match result {
+                Ok(WsMessageUnion::Close) => panic!("should not have timed out after refresh"),
+                _ => {},  // OK: either heartbeat or empty
+            }
+
+            handler.running.store(false, Ordering::Relaxed);
+        }).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_heartbeat_timeout() {
+        let ctx = Arc::new(WsContext::new(16));
+        let handler = Arc::new(WsHeartbeatHandler::new(Duration::from_secs(1), ctx.clone()));
+
+        tokio::time::timeout(Duration::from_secs(8), async {
+            let h = handler.clone();
+            tokio::spawn(async move {
+                let _ = h.start().await;
+            });
+
+            // Wait for timeout (~3s deadline + slop)
+            tokio::time::sleep(Duration::from_millis(3500)).await;
+
+            assert!(handler.running.load(Ordering::Relaxed) == false, "handler should have stopped");
+        }).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_heartbeat_already_started() {
+        let ctx = Arc::new(WsContext::new(16));
+        let handler = Arc::new(WsHeartbeatHandler::new(Duration::from_secs(1), ctx.clone()));
+
+        let h = handler.clone();
+        tokio::spawn(async move {
+            let _ = h.start().await;
+        });
+
+        // Give time for the first start to set running=true
+        tokio::time::sleep(Duration::from_millis(100)).await;
+
+        // Second start should fail
+        let result = handler.start().await;
+        assert!(matches!(result, Err(crate::Error::HeartbeatHandlerAlreadyStarted)));
+        handler.running.store(false, Ordering::Relaxed);
     }
 }
