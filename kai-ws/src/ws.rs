@@ -555,4 +555,144 @@ mod tests {
         assert_eq!(decoded.payload.as_ref().unwrap()["nested"]["array"], serde_json::json!([1, 2, 3]));
         assert_eq!(decoded.payload.as_ref().unwrap()["flag"], serde_json::json!(true));
     }
+
+    // === Group 3: WsContext core methods ===
+
+    #[tokio::test]
+    async fn test_context_new() {
+        let ctx = WsContext::new(16);
+        // Queue should be empty initially
+        let result = tokio::time::timeout(Duration::from_millis(100), ctx.sending_queue.1.recv_async()).await;
+        assert!(result.is_err(), "queue should be empty after construction");
+    }
+
+    #[tokio::test]
+    async fn test_context_next_sn() {
+        let ctx = WsContext::new(16);
+        assert_eq!(ctx.next_request_sn(), 0);
+        assert_eq!(ctx.next_request_sn(), 1);
+        assert_eq!(ctx.next_request_sn(), 2);
+        assert_eq!(ctx.next_request_sn(), 3);
+    }
+
+    #[tokio::test]
+    async fn test_context_set_bin_processor() {
+        let ctx = Arc::new(WsContext::new(16));
+        let proc = Arc::new(MockBinProcessor { called: Arc::new(Mutex::new(Vec::new())) });
+        ctx.set_bin_processor(100, proc.clone());
+        // Verify it's in the map by dispatching a binary message via ws_handle_bin_message
+        let data = Bytes::from(make_bin_header(1, 100, 200));
+        ws_handle_bin_message(data, ctx.clone()).await.unwrap();
+        // Give the spawned task time to execute
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert_eq!(proc.called.lock().unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn test_context_set_json_processor() {
+        let ctx = Arc::new(WsContext::new(16));
+        let calls: Arc<Mutex<Vec<WsMessage>>> = Arc::new(Mutex::new(Vec::new()));
+        let proc = Arc::new(MockJsonProcessor { called: calls.clone() });
+        ctx.set_json_processor(200, proc);
+        let json = serde_json::to_string(&make_message(1, 200, 200, None)).unwrap();
+        let utf8_bytes: Utf8Bytes = json.into();
+        ws_handle_json_message(utf8_bytes, ctx.clone()).await.unwrap();
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert_eq!(calls.lock().unwrap().len(), 1);
+        assert_eq!(calls.lock().unwrap()[0].payload_type, 200);
+    }
+
+    #[tokio::test]
+    async fn test_context_set_close_processor() {
+        let ctx = Arc::new(WsContext::new(16));
+        let flag = Arc::new(AtomicBool::new(false));
+        let proc = Arc::new(MockCloseProcessor { called: flag.clone() });
+        ctx.set_close_processor(proc);
+        ws_handle_close(ctx.clone()).await.unwrap();
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert!(flag.load(Ordering::SeqCst));
+    }
+
+    #[tokio::test]
+    async fn test_context_send_json() {
+        let ctx = WsContext::new(16);
+        let msg = make_message(1, 2, 3, None);
+        ctx.send_json(msg.clone()).await.unwrap();
+        let received = ctx.sending_queue.1.recv_async().await.unwrap();
+        match received {
+            WsMessageUnion::Json(m) => {
+                assert_eq!(m.sn, 1);
+                assert_eq!(m.payload_type, 2);
+            },
+            _ => panic!("expected Json variant"),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_context_send_bin() {
+        let ctx = WsContext::new(16);
+        let data = Bytes::from(vec![1, 2, 3]);
+        ctx.send_bin(data.clone()).await.unwrap();
+        let received = ctx.sending_queue.1.recv_async().await.unwrap();
+        match received {
+            WsMessageUnion::Binary(b) => {
+                assert_eq!(b.as_ref(), &[1, 2, 3]);
+            },
+            _ => panic!("expected Binary variant"),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_context_send_close() {
+        let ctx = WsContext::new(16);
+        ctx.send_close().await.unwrap();
+        let received = ctx.sending_queue.1.recv_async().await.unwrap();
+        assert!(matches!(received, WsMessageUnion::Close));
+    }
+
+    #[tokio::test]
+    async fn test_context_response_handlers() {
+        let ctx = Arc::new(WsContext::new(16));
+
+        // Test send_json_with_json_response
+        let json_calls: Arc<Mutex<Vec<WsMessage>>> = Arc::new(Mutex::new(Vec::new()));
+        let json_proc = Arc::new(MockJsonProcessor { called: json_calls.clone() });
+        let req = make_message(10, 1, 200, None);
+        ctx.send_json_with_json_response(req.clone(), json_proc).await.unwrap();
+
+        // Verify the request was sent, then dispatch a response (TYPE_RESPONSE)
+        let sent = ctx.sending_queue.1.recv_async().await.unwrap();
+        assert!(matches!(sent, WsMessageUnion::Json(_)));
+
+        let resp = serde_json::to_string(&make_message(10, TYPE_RESPONSE, 200, None)).unwrap();
+        let utf8_bytes: Utf8Bytes = resp.into();
+        ws_handle_json_message(utf8_bytes, ctx.clone()).await.unwrap();
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert_eq!(json_calls.lock().unwrap().len(), 1);
+
+        // Test send_bin_with_bin_response
+        let bin_calls: Arc<Mutex<Vec<Bytes>>> = Arc::new(Mutex::new(Vec::new()));
+        let bin_proc = Arc::new(MockBinProcessor { called: bin_calls.clone() });
+        let bin_req = Bytes::from(make_bin_header(20, 2, 200));
+        ctx.send_bin_with_bin_response(20, bin_req, bin_proc).await.unwrap();
+
+        let sent_bin = ctx.sending_queue.1.recv_async().await.unwrap();
+        assert!(matches!(sent_bin, WsMessageUnion::Binary(_)));
+
+        let resp_bin = Bytes::from(make_bin_header(20, TYPE_RESPONSE, 200));
+        ws_handle_bin_message(resp_bin, ctx.clone()).await.unwrap();
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert_eq!(bin_calls.lock().unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn test_context_send_queue_full() {
+        let ctx = WsContext::new(1);  // capacity = 1
+        let data = Bytes::from(vec![1]);
+        ctx.send_bin(data).await.unwrap();
+        // Queue is full now; send should block (never return error or panic)
+        // We just verify the first message is receivable
+        let received = ctx.sending_queue.1.recv_async().await.unwrap();
+        assert!(matches!(received, WsMessageUnion::Binary(_)));
+    }
 }
