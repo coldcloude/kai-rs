@@ -519,4 +519,40 @@ mod tests {
         assert!(parse_bin_payload_type(&short).is_err());
         assert!(parse_bin_status_code(&short).is_err());
     }
+
+    // === Group 2: WsMessage serde ===
+
+    #[test]
+    fn test_ws_message_roundtrip() {
+        let msg = make_message(42, 100, 200, Some(serde_json::json!({"key": "value"})));
+        let json = serde_json::to_string(&msg).unwrap();
+        let decoded: WsMessage = serde_json::from_str(&json).unwrap();
+        assert_eq!(decoded.sn, 42);
+        assert_eq!(decoded.payload_type, 100);
+        assert_eq!(decoded.status_code, 200);
+        assert_eq!(decoded.payload, Some(serde_json::json!({"key": "value"})));
+    }
+
+    #[test]
+    fn test_ws_message_payload_none() {
+        let msg = make_message(1, 2, 3, None);
+        let json = serde_json::to_string(&msg).unwrap();
+        let decoded: WsMessage = serde_json::from_str(&json).unwrap();
+        assert_eq!(decoded.sn, 1);
+        assert_eq!(decoded.payload_type, 2);
+        assert_eq!(decoded.status_code, 3);
+        assert!(decoded.payload.is_none());
+    }
+
+    #[test]
+    fn test_ws_message_payload_value() {
+        let msg = make_message(0, 0, 0, Some(serde_json::json!({
+            "nested": {"array": [1, 2, 3]},
+            "flag": true
+        })));
+        let json = serde_json::to_string(&msg).unwrap();
+        let decoded: WsMessage = serde_json::from_str(&json).unwrap();
+        assert_eq!(decoded.payload.as_ref().unwrap()["nested"]["array"], serde_json::json!([1, 2, 3]));
+        assert_eq!(decoded.payload.as_ref().unwrap()["flag"], serde_json::json!(true));
+    }
 }
