@@ -893,4 +893,46 @@ mod tests {
         assert!(matches!(result, Err(crate::Error::HeartbeatHandlerAlreadyStarted)));
         handler.running.store(false, Ordering::Relaxed);
     }
+
+    // === Group 6: WsHeaderFilter tests ===
+
+    struct AcceptFilter;
+
+    impl WsHeaderFilter for AcceptFilter {
+        fn filter(&self, _request: &http::Request<()>) -> Result<()> {
+            Ok(())
+        }
+    }
+
+    struct RejectFilter;
+
+    impl WsHeaderFilter for RejectFilter {
+        fn filter(&self, _request: &http::Request<()>) -> Result<()> {
+            Err(crate::Error::UpgradeRejected("not allowed".to_string()))
+        }
+    }
+
+    #[test]
+    fn test_filter_accept() {
+        let filter = AcceptFilter;
+        let request = http::Request::builder()
+            .uri("ws://example.com/ws")
+            .header("Authorization", "Bearer test")
+            .body(())
+            .unwrap();
+        let result = filter.filter(&request);
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_filter_reject() {
+        let filter = RejectFilter;
+        let request = http::Request::builder()
+            .uri("ws://example.com/ws")
+            .body(())
+            .unwrap();
+        let result = filter.filter(&request);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("not allowed"));
+    }
 }
