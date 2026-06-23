@@ -21,6 +21,9 @@ pub enum Error {
 
     #[error("wss upgrade rejected: {0}")]
     UpgradeRejected(String),
+
+    #[error("buffer too short: need {need} bytes, got {got}")]
+    BufferTooShort { need: usize, got: usize },
 }
 
 pub type Result<T> = std::result::Result<T, Error>;

@@ -52,17 +52,29 @@ pub const OFFSET_STATUS_CODE: usize = OFFSET_PAYLOAD_TYPE + LEN_PAYLOAD_TYPE;
 pub const LEN_STATUS_CODE: usize = 4;
 
 pub fn parse_bin_sn(data: &[u8]) -> Result<u32> {
-    let sn_bin: [u8; 4] = data[OFFSET_SN..OFFSET_SN + LEN_SN].try_into()?;
+    let end = OFFSET_SN + LEN_SN;
+    if data.len() < end {
+        return Err(Error::BufferTooShort { need: end, got: data.len() });
+    }
+    let sn_bin: [u8; 4] = data[OFFSET_SN..end].try_into().unwrap();
     Ok(u32::from_be_bytes(sn_bin))
 }
 
 pub fn parse_bin_payload_type(data: &[u8]) -> Result<u32> {
-    let type_bin: [u8; 4] = data[OFFSET_PAYLOAD_TYPE..OFFSET_PAYLOAD_TYPE + LEN_PAYLOAD_TYPE].try_into()?;
+    let end = OFFSET_PAYLOAD_TYPE + LEN_PAYLOAD_TYPE;
+    if data.len() < end {
+        return Err(Error::BufferTooShort { need: end, got: data.len() });
+    }
+    let type_bin: [u8; 4] = data[OFFSET_PAYLOAD_TYPE..end].try_into().unwrap();
     Ok(u32::from_be_bytes(type_bin))
 }
 
 pub fn parse_bin_status_code(data: &[u8]) -> Result<u32> {
-    let code_bin: [u8; 4] = data[OFFSET_STATUS_CODE..OFFSET_STATUS_CODE + LEN_STATUS_CODE].try_into()?;
+    let end = OFFSET_STATUS_CODE + LEN_STATUS_CODE;
+    if data.len() < end {
+        return Err(Error::BufferTooShort { need: end, got: data.len() });
+    }
+    let code_bin: [u8; 4] = data[OFFSET_STATUS_CODE..end].try_into().unwrap();
     Ok(u32::from_be_bytes(code_bin))
 }
 
@@ -428,8 +440,6 @@ mod tests {
     use std::sync::{Arc, Mutex};
     use std::sync::atomic::{AtomicBool, Ordering};
     use bytes::Bytes;
-    use tokio::time::Duration;
-
     use super::*;
 
     // Mock processor for JSON messages - records invocations
@@ -480,5 +490,33 @@ mod tests {
     // Helper: construct a WsMessage
     fn make_message(sn: u32, payload_type: u32, status_code: u32, payload: Option<serde_json::Value>) -> WsMessage {
         WsMessage { sn, payload_type, status_code, payload }
+    }
+
+    // === Group 1: Binary parse functions ===
+
+    #[test]
+    fn test_parse_bin_sn() {
+        let buf = make_bin_header(0x01020304, 0, 0);
+        assert_eq!(parse_bin_sn(&buf).unwrap(), 0x01020304);
+    }
+
+    #[test]
+    fn test_parse_bin_payload_type() {
+        let buf = make_bin_header(0, 0xA0B0C0D0, 0);
+        assert_eq!(parse_bin_payload_type(&buf).unwrap(), 0xA0B0C0D0);
+    }
+
+    #[test]
+    fn test_parse_bin_status_code() {
+        let buf = make_bin_header(0, 0, 200);
+        assert_eq!(parse_bin_status_code(&buf).unwrap(), 200);
+    }
+
+    #[test]
+    fn test_parse_bin_out_of_bounds() {
+        let short = vec![0u8; 3];
+        assert!(parse_bin_sn(&short).is_err());
+        assert!(parse_bin_payload_type(&short).is_err());
+        assert!(parse_bin_status_code(&short).is_err());
     }
 }
