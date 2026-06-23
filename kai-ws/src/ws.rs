@@ -422,3 +422,63 @@ impl WsBinaryProcessor for WsHeartbeatHandler {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use std::sync::{Arc, Mutex};
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use bytes::Bytes;
+    use tokio::time::Duration;
+
+    use super::*;
+
+    // Mock processor for JSON messages - records invocations
+    struct MockJsonProcessor {
+        called: Arc<Mutex<Vec<WsMessage>>>,
+    }
+
+    #[async_trait]
+    impl WsJsonProcessor for MockJsonProcessor {
+        async fn process_json(&self, data: WsMessage, _context: Arc<WsContext>) {
+            self.called.lock().unwrap().push(data);
+        }
+    }
+
+    // Mock processor for binary messages - records invocations
+    struct MockBinProcessor {
+        called: Arc<Mutex<Vec<Bytes>>>,
+    }
+
+    #[async_trait]
+    impl WsBinaryProcessor for MockBinProcessor {
+        async fn process_bin(&self, data: &[u8], _context: Arc<WsContext>) {
+            self.called.lock().unwrap().push(Bytes::copy_from_slice(data));
+        }
+    }
+
+    // Mock close processor
+    struct MockCloseProcessor {
+        called: Arc<AtomicBool>,
+    }
+
+    #[async_trait]
+    impl WsCloseProcessor for MockCloseProcessor {
+        async fn process_close(&self, _context: Arc<WsContext>) {
+            self.called.store(true, Ordering::SeqCst);
+        }
+    }
+
+    // Helper: build a 12-byte binary header
+    fn make_bin_header(sn: u32, payload_type: u32, status_code: u32) -> Vec<u8> {
+        let mut buf = Vec::with_capacity(12);
+        buf.extend_from_slice(&sn.to_be_bytes());
+        buf.extend_from_slice(&payload_type.to_be_bytes());
+        buf.extend_from_slice(&status_code.to_be_bytes());
+        buf
+    }
+
+    // Helper: construct a WsMessage
+    fn make_message(sn: u32, payload_type: u32, status_code: u32, payload: Option<serde_json::Value>) -> WsMessage {
+        WsMessage { sn, payload_type, status_code, payload }
+    }
+}
