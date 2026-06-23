@@ -695,4 +695,94 @@ mod tests {
         let received = ctx.sending_queue.1.recv_async().await.unwrap();
         assert!(matches!(received, WsMessageUnion::Binary(_)));
     }
+
+    // === Group 4: Message dispatch logic ===
+
+    #[tokio::test]
+    async fn test_handle_json_request() {
+        let ctx = Arc::new(WsContext::new(16));
+        let calls: Arc<Mutex<Vec<WsMessage>>> = Arc::new(Mutex::new(Vec::new()));
+        let proc = Arc::new(MockJsonProcessor { called: calls.clone() });
+        ctx.set_json_processor(99, proc);
+
+        let msg = make_message(1, 99, 200, None);
+        let json = serde_json::to_string(&msg).unwrap();
+        let utf8_bytes: Utf8Bytes = json.into();
+        ws_handle_json_message(utf8_bytes, ctx.clone()).await.unwrap();
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert_eq!(calls.lock().unwrap().len(), 1);
+        assert_eq!(calls.lock().unwrap()[0].sn, 1);
+    }
+
+    #[tokio::test]
+    async fn test_handle_json_response() {
+        let ctx = Arc::new(WsContext::new(16));
+        let calls: Arc<Mutex<Vec<WsMessage>>> = Arc::new(Mutex::new(Vec::new()));
+        let proc = Arc::new(MockJsonProcessor { called: calls.clone() });
+        // Register as response processor (keyed by sn)
+        ctx.reponse_json_processor_map.insert(5, proc);
+
+        let msg = make_message(5, TYPE_RESPONSE, 200, None);
+        let json = serde_json::to_string(&msg).unwrap();
+        let utf8_bytes: Utf8Bytes = json.into();
+        ws_handle_json_message(utf8_bytes, ctx.clone()).await.unwrap();
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert_eq!(calls.lock().unwrap().len(), 1);
+        assert_eq!(calls.lock().unwrap()[0].sn, 5);
+    }
+
+    #[tokio::test]
+    async fn test_handle_bin_request() {
+        let ctx = Arc::new(WsContext::new(16));
+        let calls: Arc<Mutex<Vec<Bytes>>> = Arc::new(Mutex::new(Vec::new()));
+        let proc = Arc::new(MockBinProcessor { called: calls.clone() });
+        ctx.set_bin_processor(77, proc);
+
+        let data = Bytes::from(make_bin_header(1, 77, 200));
+        ws_handle_bin_message(data.clone(), ctx.clone()).await.unwrap();
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert_eq!(calls.lock().unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn test_handle_bin_response() {
+        let ctx = Arc::new(WsContext::new(16));
+        let calls: Arc<Mutex<Vec<Bytes>>> = Arc::new(Mutex::new(Vec::new()));
+        let proc = Arc::new(MockBinProcessor { called: calls.clone() });
+        ctx.reponse_bin_processor_map.insert(8, proc);
+
+        let data = Bytes::from(make_bin_header(8, TYPE_RESPONSE, 200));
+        ws_handle_bin_message(data.clone(), ctx.clone()).await.unwrap();
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert_eq!(calls.lock().unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn test_handle_close() {
+        let ctx = Arc::new(WsContext::new(16));
+        let flag = Arc::new(AtomicBool::new(false));
+        let proc = Arc::new(MockCloseProcessor { called: flag.clone() });
+        ctx.set_close_processor(proc);
+
+        ws_handle_close(ctx.clone()).await.unwrap();
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert!(flag.load(Ordering::SeqCst));
+    }
+
+    #[tokio::test]
+    async fn test_handle_unregistered_type() {
+        let ctx = Arc::new(WsContext::new(16));
+
+        // JSON with unregistered payload_type - should not panic
+        let msg = make_message(1, 999, 200, None);
+        let json = serde_json::to_string(&msg).unwrap();
+        let utf8_bytes: Utf8Bytes = json.into();
+        let result = ws_handle_json_message(utf8_bytes, ctx.clone()).await;
+        assert!(result.is_ok());
+
+        // Binary with unregistered payload_type - should not panic
+        let data = Bytes::from(make_bin_header(1, 999, 200));
+        let result = ws_handle_bin_message(data, ctx.clone()).await;
+        assert!(result.is_ok());
+    }
 }
