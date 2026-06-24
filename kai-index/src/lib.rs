@@ -89,4 +89,25 @@ mod tests {
         let result = distinct_index.find(&vec![1,1,1,1,1]);
         assert_eq!(result.contains(&key), false);
     }
+
+    #[test]
+    fn test_substring_index_single_token() {
+        let mut idx: SubstringIndex<String> = SubstringIndex::new(32);
+        let key = "agent1".to_string();
+        let doc = crate::document::to_document("Alice");
+        idx.insert(&key, &doc);
+        let results = idx.find_all_keys("Alice", false);
+        assert_eq!(results.len(), 1, "should find 1 result for 'Alice'");
+        assert_eq!(results[0], "agent1");
+    }
+
+    #[test]
+    fn test_substring_index_multi_token() {
+        let mut idx: SubstringIndex<String> = SubstringIndex::new(32);
+        idx.insert(&"k1".to_string(), &crate::document::to_document("Hello world"));
+        idx.insert(&"k2".to_string(), &crate::document::to_document("Hello there"));
+        let r = idx.find_all_keys("world", false);
+        assert_eq!(r.len(), 1, "should find 1 for 'world'");
+        assert_eq!(r[0], "k1");
+    }
 }
