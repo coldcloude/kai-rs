@@ -52,30 +52,24 @@ pub const OFFSET_STATUS_CODE: usize = OFFSET_PAYLOAD_TYPE + LEN_PAYLOAD_TYPE;
 pub const LEN_STATUS_CODE: usize = 4;
 
 pub fn parse_bin_sn(data: &[u8]) -> Result<u32> {
-    let end = OFFSET_SN + LEN_SN;
-    if data.len() < end {
-        return Err(Error::BufferTooShort { need: end, got: data.len() });
-    }
-    let sn_bin: [u8; 4] = data[OFFSET_SN..end].try_into().unwrap();
-    Ok(u32::from_be_bytes(sn_bin))
+    let sn_bytes: [u8; 4] = data.get(OFFSET_SN..OFFSET_SN + LEN_SN)
+        .and_then(|s| s.try_into().ok())
+        .ok_or(Error::BinParse)?;
+    Ok(u32::from_be_bytes(sn_bytes))
 }
 
 pub fn parse_bin_payload_type(data: &[u8]) -> Result<u32> {
-    let end = OFFSET_PAYLOAD_TYPE + LEN_PAYLOAD_TYPE;
-    if data.len() < end {
-        return Err(Error::BufferTooShort { need: end, got: data.len() });
-    }
-    let type_bin: [u8; 4] = data[OFFSET_PAYLOAD_TYPE..end].try_into().unwrap();
-    Ok(u32::from_be_bytes(type_bin))
+    let type_bytes: [u8; 4] = data.get(OFFSET_PAYLOAD_TYPE..OFFSET_PAYLOAD_TYPE + LEN_PAYLOAD_TYPE)
+        .and_then(|s| s.try_into().ok())
+        .ok_or(Error::BinParse)?;
+    Ok(u32::from_be_bytes(type_bytes))
 }
 
 pub fn parse_bin_status_code(data: &[u8]) -> Result<u32> {
-    let end = OFFSET_STATUS_CODE + LEN_STATUS_CODE;
-    if data.len() < end {
-        return Err(Error::BufferTooShort { need: end, got: data.len() });
-    }
-    let code_bin: [u8; 4] = data[OFFSET_STATUS_CODE..end].try_into().unwrap();
-    Ok(u32::from_be_bytes(code_bin))
+    let code_bytes: [u8; 4] = data.get(OFFSET_STATUS_CODE..OFFSET_STATUS_CODE + LEN_STATUS_CODE)
+        .and_then(|s| s.try_into().ok())
+        .ok_or(Error::BinParse)?;
+    Ok(u32::from_be_bytes(code_bytes))
 }
 
 #[derive(Debug)]

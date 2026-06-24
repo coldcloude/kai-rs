@@ -4,8 +4,8 @@ use crate::WsMessageUnion;
 
 #[derive(Error, Debug)]
 pub enum Error {
-    #[error("bin parse error: {0}")]
-    BinParse(#[from] std::array::TryFromSliceError),
+    #[error("bin parse error: data too short")]
+    BinParse,
 
     #[error("ws error: {0}")]
     WebSocket(#[from] tokio_tungstenite::tungstenite::Error),
@@ -18,9 +18,6 @@ pub enum Error {
 
     #[error("heartbeat handler already started")]
     HeartbeatHandlerAlreadyStarted,
-
-    #[error("buffer too short: need {need} bytes, got {got}")]
-    BufferTooShort { need: usize, got: usize },
 }
 
 pub type Result<T> = std::result::Result<T, Error>;
