@@ -19,9 +19,6 @@ pub enum Error {
     #[error("heartbeat handler already started")]
     HeartbeatHandlerAlreadyStarted,
 
-    #[error("wss upgrade rejected: {0}")]
-    UpgradeRejected(String),
-
     #[error("buffer too short: need {need} bytes, got {got}")]
     BufferTooShort { need: usize, got: usize },
 }

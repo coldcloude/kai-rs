@@ -170,10 +170,10 @@ pub trait WsProcessorInitializer<P>: Send + Sync {
 /// WSS 握手阶段请求头过滤器。
 /// 在 WebSocket Upgrade 完成后、WebSocket 流建立前调用。
 /// filter 接收 HTTP Request 的引用，可检查请求头。
-/// 返回 Ok(()) 表示通过，返回 Err 表示拒绝连接。
+/// 返回 Ok(()) 表示通过，返回 Err 表示拒绝连接（携带完整的 HTTP 错误响应）。
 /// 注意：此 trait 是同步的，因为 accept_hdr_async 的回调是同步闭包。
 pub trait WsHeaderFilter: Send + Sync {
-    fn filter(&self, request: &http::Request<()>) -> Result<()>;
+    fn filter(&self, request: &http::Request<()>) -> std::result::Result<(), http::Response<Option<String>>>;
 }
 
 async fn ws_handle_json_message(json: Utf8Bytes, recv_ctx: Arc<WsContext>) -> Result<()> {
@@ -236,9 +236,7 @@ where
     let ws_stream = if !filters.is_empty() {
         accept_hdr_async(stream, |request: &http::Request<()>, response: http::Response<()>| {
             for filter in filters {
-                if let Err(e) = filter.filter(request) {
-                    let mut err_response = http::Response::new(Some(e.to_string()));
-                    *err_response.status_mut() = http::StatusCode::UNAUTHORIZED;
+                if let Err(err_response) = filter.filter(request) {
                     return Err(err_response);
                 }
             }
@@ -899,7 +897,7 @@ mod tests {
     struct AcceptFilter;
 
     impl WsHeaderFilter for AcceptFilter {
-        fn filter(&self, _request: &http::Request<()>) -> Result<()> {
+        fn filter(&self, _request: &http::Request<()>) -> std::result::Result<(), http::Response<Option<String>>> {
             Ok(())
         }
     }
@@ -907,8 +905,11 @@ mod tests {
     struct RejectFilter;
 
     impl WsHeaderFilter for RejectFilter {
-        fn filter(&self, _request: &http::Request<()>) -> Result<()> {
-            Err(crate::Error::UpgradeRejected("not allowed".to_string()))
+        fn filter(&self, _request: &http::Request<()>) -> std::result::Result<(), http::Response<Option<String>>> {
+            Err(http::Response::builder()
+                .status(http::StatusCode::UNAUTHORIZED)
+                .body(Some("not allowed".to_string()))
+                .unwrap())
         }
     }
 
@@ -933,6 +934,8 @@ mod tests {
             .unwrap();
         let result = filter.filter(&request);
         assert!(result.is_err());
-        assert!(result.unwrap_err().to_string().contains("not allowed"));
+        let err_response = result.unwrap_err();
+        assert_eq!(err_response.status(), http::StatusCode::UNAUTHORIZED);
+        assert_eq!(err_response.body(), &Some("not allowed".to_string()));
     }
 }
