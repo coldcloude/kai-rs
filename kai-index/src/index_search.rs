@@ -200,26 +200,35 @@ where
         for split_tokens in &self.split_tokens_list {
             //对每一种拆分方式提取结果，要求拆分出的每个tokens都能匹配到
             let mut priority: usize = 0;
-            let mut combine_result = HashSet::new();
+            let mut combine_result: Option<HashSet<K>> = None;
             for (tokens, range_map) in split_tokens {
                 for (range, count) in range_map {
                     priority += count;
                     match raw_result_map.get_mut(&tokens[range.start..range.end]) {
                         None => {
                             //有一个tokens没有找到，查询失败
-                            combine_result.clear();
+                            combine_result = None;
                             break;
                         },
                         Some(raw_result) => {
-                            //合并结果，取交集
-                            combine_result.retain(|k| raw_result.contains(k));
+                            //第一次用 raw_result 填充，后续取交集
+                            match combine_result.as_mut() {
+                                None => {
+                                    combine_result = Some(raw_result.clone());
+                                },
+                                Some(existing) => {
+                                    existing.retain(|k| raw_result.contains(k));
+                                },
+                            }
                         },
                     }
                 }
             }
             //保存到最终结果
-            if !combine_result.is_empty() {
-                combine_priority_key_map(priority_result, &mut combine_result, priority);
+            if let Some(ref mut result) = combine_result {
+                if !result.is_empty() {
+                    combine_priority_key_map(priority_result, result, priority);
+                }
             }
         }
     }
