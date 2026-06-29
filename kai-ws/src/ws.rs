@@ -29,7 +29,7 @@ pub struct WsMessage {
 
 #[async_trait]
 pub trait WsBinaryProcessor: Send + Sync + 'static {
-    async fn process_bin(&self, data: &[u8], context: Arc<WsContext>);
+    async fn process_bin(&self, data: Bytes, context: Arc<WsContext>);
 }
 
 #[async_trait]
@@ -199,7 +199,7 @@ async fn ws_handle_bin_message(data: Bytes, recv_ctx: Arc<WsContext>) -> Result<
         let proc = processor.clone();
         let ctx = recv_ctx.clone();
         tokio::spawn(async move {
-            proc.process_bin(data.as_ref(), ctx).await;
+            proc.process_bin(data, ctx).await;
         });
     };
     Ok(())
@@ -421,7 +421,7 @@ impl WsHeartbeatHandler {
 #[async_trait]
 impl WsBinaryProcessor for WsHeartbeatHandler {
     //收到数据后，更新timeout
-    async fn process_bin(&self, _: &[u8], _: Arc<WsContext>) {
+    async fn process_bin(&self, _: Bytes, _: Arc<WsContext>) {
         if self.running.load(Ordering::Relaxed) {
             self.update_deadline();
         }
@@ -455,8 +455,8 @@ mod tests {
 
     #[async_trait]
     impl WsBinaryProcessor for MockBinProcessor {
-        async fn process_bin(&self, data: &[u8], _context: Arc<WsContext>) {
-            self.called.lock().unwrap().push(Bytes::copy_from_slice(data));
+        async fn process_bin(&self, data: Bytes, _context: Arc<WsContext>) {
+            self.called.lock().unwrap().push(data);
         }
     }
 
@@ -829,7 +829,7 @@ mod tests {
             // Feed data periodically to refresh deadline
             for _ in 0..4 {
                 tokio::time::sleep(Duration::from_millis(500)).await;
-                handler.process_bin(&[0u8; 12], ctx.clone()).await;
+                handler.process_bin(Bytes::from_static(&[0u8; 12]), ctx.clone()).await;
             }
 
             // After ~2s with refreshes, no close should have been sent
