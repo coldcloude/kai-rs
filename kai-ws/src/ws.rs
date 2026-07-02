@@ -38,6 +38,16 @@ pub trait WsJsonProcessor: Send + Sync + 'static {
 }
 
 #[async_trait]
+pub trait WsBinaryProcessorMut: Send + Sync + 'static {
+    async fn process_bin(&mut self, data: Bytes, context: Arc<WsContext>);
+}
+
+#[async_trait]
+pub trait WsJsonProcessorMut: Send + Sync + 'static {
+    async fn process_json(&mut self, data: WsMessage, context: Arc<WsContext>);
+}
+
+#[async_trait]
 pub trait WsCloseProcessor: Send + Sync + 'static {
     async fn process_close(&self, context: Arc<WsContext>);
 }
@@ -85,8 +95,8 @@ pub struct WsContext {
     request_bin_processor_map: DashMap<u32, Arc<dyn WsBinaryProcessor>>,
     request_json_processor_map: DashMap<u32, Arc<dyn WsJsonProcessor>>,
     close_processor: Arc<RwLock<Option<Arc<dyn WsCloseProcessor>>>>,
-    reponse_bin_processor_map: DashMap<u32, Arc<dyn WsBinaryProcessor>>,
-    reponse_json_processor_map: DashMap<u32, Arc<dyn WsJsonProcessor>>,
+    reponse_bin_processor_map: DashMap<u32, Box<dyn WsBinaryProcessorMut>>,
+    reponse_json_processor_map: DashMap<u32, Box<dyn WsJsonProcessorMut>>,
 }
 
 impl WsContext {
@@ -130,22 +140,22 @@ impl WsContext {
         Ok(())
     }
 
-    pub async fn send_json_with_json_response(&self, request: WsMessage, response_handler: Arc<dyn WsJsonProcessor>) -> Result<()> {
+    pub async fn send_json_with_json_response(&self, request: WsMessage, response_handler: Box<dyn WsJsonProcessorMut>) -> Result<()> {
         self.reponse_json_processor_map.insert(request.sn, response_handler);
         self.send_json(request).await
     }
 
-    pub async fn send_bin_with_json_response(&self, sn: u32, request: Bytes, response_handler: Arc<dyn WsJsonProcessor>) -> Result<()> {
+    pub async fn send_bin_with_json_response(&self, sn: u32, request: Bytes, response_handler: Box<dyn WsJsonProcessorMut>) -> Result<()> {
         self.reponse_json_processor_map.insert(sn, response_handler);
         self.send_bin(request).await
     }
 
-    pub async fn send_json_with_bin_response(&self, request: WsMessage, response_handler: Arc<dyn WsBinaryProcessor>) -> Result<()> {
+    pub async fn send_json_with_bin_response(&self, request: WsMessage, response_handler: Box<dyn WsBinaryProcessorMut>) -> Result<()> {
         self.reponse_bin_processor_map.insert(request.sn, response_handler);
         self.send_json(request).await
     }
 
-    pub async fn send_bin_with_bin_response(&self, sn: u32, request: Bytes, response_handler: Arc<dyn WsBinaryProcessor>) -> Result<()> {
+    pub async fn send_bin_with_bin_response(&self, sn: u32, request: Bytes, response_handler: Box<dyn WsBinaryProcessorMut>) -> Result<()> {
         self.reponse_bin_processor_map.insert(sn, response_handler);
         self.send_bin(request).await
     }
@@ -172,35 +182,43 @@ pub trait WsHeaderFilter: Send + Sync {
 
 async fn ws_handle_json_message(json: Utf8Bytes, recv_ctx: Arc<WsContext>) -> Result<()> {
     let message = serde_json::from_str::<WsMessage>(&json)?;
-    let processor = if message.payload_type == TYPE_RESPONSE {
-        recv_ctx.reponse_json_processor_map.get(&message.sn)
-    } else {
-        recv_ctx.request_json_processor_map.get(&message.payload_type)
-    };
-    if let Some(processor) = processor {
-        let proc = processor.clone();
+    if message.payload_type == TYPE_RESPONSE {
+        if let Some((_,mut processor)) = recv_ctx.reponse_json_processor_map.remove(&message.sn) {
         let ctx = recv_ctx.clone();
-        tokio::spawn(async move {
-            proc.process_json(message, ctx).await;
-        });
-    }
+            tokio::spawn(async move {
+                processor.process_json(message, ctx).await;
+            });
+        }
+    } else {
+        if let Some(processor) = recv_ctx.request_json_processor_map.get(&message.payload_type) {
+            let proc = processor.clone();
+            let ctx = recv_ctx.clone();
+            tokio::spawn(async move {
+                proc.process_json(message, ctx).await;
+            });
+        }
+    };
     Ok(())
 }
 
 async fn ws_handle_bin_message(data: Bytes, recv_ctx: Arc<WsContext>) -> Result<()> {
     let sn = parse_bin_sn(data.as_ref())?;
     let payload_type = parse_bin_payload_type(data.as_ref())?;
-    let processor = if payload_type == TYPE_RESPONSE {
-        recv_ctx.reponse_bin_processor_map.get(&sn)
+    if payload_type == TYPE_RESPONSE {
+        if let Some((_,mut processor)) = recv_ctx.reponse_bin_processor_map.remove(&sn) {
+            let ctx = recv_ctx.clone();
+            tokio::spawn(async move {
+                processor.process_bin(data, ctx).await;
+            });
+        }
     } else {
-        recv_ctx.request_bin_processor_map.get(&payload_type)
-    };
-    if let Some(processor) = processor {
-        let proc = processor.clone();
-        let ctx = recv_ctx.clone();
-        tokio::spawn(async move {
-            proc.process_bin(data, ctx).await;
-        });
+        if let Some(processor) = recv_ctx.request_bin_processor_map.get(&payload_type) {
+            let proc = processor.clone();
+            let ctx = recv_ctx.clone();
+            tokio::spawn(async move {
+                proc.process_bin(data, ctx).await;
+            });
+        }
     };
     Ok(())
 }
