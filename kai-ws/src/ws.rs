@@ -39,12 +39,12 @@ pub trait WsJsonProcessor: Send + Sync + 'static {
 
 #[async_trait]
 pub trait WsBinaryProcessorMut: Send + Sync + 'static {
-    async fn process_bin(&mut self, data: Bytes, context: Arc<WsContext>);
+    async fn process_bin(mut self: Box<Self>, data: Bytes, context: Arc<WsContext>);
 }
 
 #[async_trait]
 pub trait WsJsonProcessorMut: Send + Sync + 'static {
-    async fn process_json(&mut self, data: WsMessage, context: Arc<WsContext>);
+    async fn process_json(mut self: Box<Self>, data: WsMessage, context: Arc<WsContext>);
 }
 
 #[async_trait]
@@ -183,7 +183,7 @@ pub trait WsHeaderFilter: Send + Sync {
 async fn ws_handle_json_message(json: Utf8Bytes, recv_ctx: Arc<WsContext>) -> Result<()> {
     let message = serde_json::from_str::<WsMessage>(&json)?;
     if message.payload_type == TYPE_RESPONSE {
-        if let Some((_,mut processor)) = recv_ctx.reponse_json_processor_map.remove(&message.sn) {
+        if let Some((_,processor)) = recv_ctx.reponse_json_processor_map.remove(&message.sn) {
         let ctx = recv_ctx.clone();
             tokio::spawn(async move {
                 processor.process_json(message, ctx).await;
@@ -205,7 +205,7 @@ async fn ws_handle_bin_message(data: Bytes, recv_ctx: Arc<WsContext>) -> Result<
     let sn = parse_bin_sn(data.as_ref())?;
     let payload_type = parse_bin_payload_type(data.as_ref())?;
     if payload_type == TYPE_RESPONSE {
-        if let Some((_,mut processor)) = recv_ctx.reponse_bin_processor_map.remove(&sn) {
+        if let Some((_,processor)) = recv_ctx.reponse_bin_processor_map.remove(&sn) {
             let ctx = recv_ctx.clone();
             tokio::spawn(async move {
                 processor.process_bin(data, ctx).await;
@@ -485,7 +485,7 @@ mod tests {
 
     #[async_trait]
     impl WsJsonProcessorMut for MockJsonProcessorMut {
-        async fn process_json(&mut self, data: WsMessage, _context: Arc<WsContext>) {
+        async fn process_json(self: Box<Self>, data: WsMessage, _context: Arc<WsContext>) {
             self.called.lock().unwrap().push(data);
         }
     }
@@ -496,7 +496,7 @@ mod tests {
 
     #[async_trait]
     impl WsBinaryProcessorMut for MockBinProcessorMut {
-        async fn process_bin(&mut self, data: Bytes, _context: Arc<WsContext>) {
+        async fn process_bin(self: Box<Self>, data: Bytes, _context: Arc<WsContext>) {
             self.called.lock().unwrap().push(data);
         }
     }
