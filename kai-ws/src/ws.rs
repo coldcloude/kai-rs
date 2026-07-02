@@ -478,6 +478,29 @@ mod tests {
         }
     }
 
+    // Mock Mut processors for response handler tests
+    struct MockJsonProcessorMut {
+        called: Arc<Mutex<Vec<WsMessage>>>,
+    }
+
+    #[async_trait]
+    impl WsJsonProcessorMut for MockJsonProcessorMut {
+        async fn process_json(&mut self, data: WsMessage, _context: Arc<WsContext>) {
+            self.called.lock().unwrap().push(data);
+        }
+    }
+
+    struct MockBinProcessorMut {
+        called: Arc<Mutex<Vec<Bytes>>>,
+    }
+
+    #[async_trait]
+    impl WsBinaryProcessorMut for MockBinProcessorMut {
+        async fn process_bin(&mut self, data: Bytes, _context: Arc<WsContext>) {
+            self.called.lock().unwrap().push(data);
+        }
+    }
+
     // Mock close processor
     struct MockCloseProcessor {
         called: Arc<AtomicBool>,
@@ -668,9 +691,9 @@ mod tests {
 
         // Test send_json_with_json_response
         let json_calls: Arc<Mutex<Vec<WsMessage>>> = Arc::new(Mutex::new(Vec::new()));
-        let json_proc = Arc::new(MockJsonProcessor { called: json_calls.clone() });
+        let json_proc = MockJsonProcessorMut { called: json_calls.clone() };
         let req = make_message(10, 1, 200, None);
-        ctx.send_json_with_json_response(req.clone(), json_proc).await.unwrap();
+        ctx.send_json_with_json_response(req.clone(), Box::new(json_proc)).await.unwrap();
 
         // Verify the request was sent, then dispatch a response (TYPE_RESPONSE)
         let sent = ctx.sending_queue.1.recv_async().await.unwrap();
@@ -684,9 +707,9 @@ mod tests {
 
         // Test send_bin_with_bin_response
         let bin_calls: Arc<Mutex<Vec<Bytes>>> = Arc::new(Mutex::new(Vec::new()));
-        let bin_proc = Arc::new(MockBinProcessor { called: bin_calls.clone() });
+        let bin_proc = MockBinProcessorMut { called: bin_calls.clone() };
         let bin_req = Bytes::from(make_bin_header(20, 2, 200));
-        ctx.send_bin_with_bin_response(20, bin_req, bin_proc).await.unwrap();
+        ctx.send_bin_with_bin_response(20, bin_req, Box::new(bin_proc)).await.unwrap();
 
         let sent_bin = ctx.sending_queue.1.recv_async().await.unwrap();
         assert!(matches!(sent_bin, WsMessageUnion::Binary(_)));
@@ -730,9 +753,12 @@ mod tests {
     async fn test_handle_json_response() {
         let ctx = Arc::new(WsContext::new(16));
         let calls: Arc<Mutex<Vec<WsMessage>>> = Arc::new(Mutex::new(Vec::new()));
-        let proc = Arc::new(MockJsonProcessor { called: calls.clone() });
-        // Register as response processor (keyed by sn)
-        ctx.reponse_json_processor_map.insert(5, proc);
+        let proc = MockJsonProcessorMut { called: calls.clone() };
+        // Register as response processor via send_json_with_json_response
+        let req = make_message(5, 1, 200, None);
+        ctx.send_json_with_json_response(req, Box::new(proc)).await.unwrap();
+        // Drain the sent request from queue
+        let _ = ctx.sending_queue.1.recv_async().await.unwrap();
 
         let msg = make_message(5, TYPE_RESPONSE, 200, None);
         let json = serde_json::to_string(&msg).unwrap();
@@ -760,8 +786,12 @@ mod tests {
     async fn test_handle_bin_response() {
         let ctx = Arc::new(WsContext::new(16));
         let calls: Arc<Mutex<Vec<Bytes>>> = Arc::new(Mutex::new(Vec::new()));
-        let proc = Arc::new(MockBinProcessor { called: calls.clone() });
-        ctx.reponse_bin_processor_map.insert(8, proc);
+        let proc = MockBinProcessorMut { called: calls.clone() };
+        // Register as response processor via send_bin_with_bin_response
+        let req = Bytes::from(make_bin_header(8, 1, 200));
+        ctx.send_bin_with_bin_response(8, req, Box::new(proc)).await.unwrap();
+        // Drain the sent request from queue
+        let _ = ctx.sending_queue.1.recv_async().await.unwrap();
 
         let data = Bytes::from(make_bin_header(8, TYPE_RESPONSE, 200));
         ws_handle_bin_message(data.clone(), ctx.clone()).await.unwrap();
