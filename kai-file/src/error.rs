@@ -5,6 +5,9 @@ pub enum Error {
     #[error("IO error: {0}")]
     IoError(#[from] std::io::Error),
 
+    #[error("JSON error: {0}")]
+    Json(#[from] serde_json::Error),
+
     #[error("File is empty")]
     FileEmpty,
 
