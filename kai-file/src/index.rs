@@ -29,16 +29,12 @@ pub trait QueryParser<Q,K> {
     fn parse_query(&self, query: Q) -> Vec<(K, (String, String))>;
 }
 
-pub trait RecordCombiner<K,R,RR> {
-    fn combine_record(&self, key: &K, record: &R) -> RR;
-}
-
 #[derive(Debug, Clone)]
 struct FilePosition {
     pub start_pos: u64,
     pub end_pos: u64,
-    pub start_line_index: u64,
-    pub end_line_index: u64,
+    pub start_line_index: u32,
+    pub end_line_index: u32,
 }
 
 struct FileIndices {
@@ -47,7 +43,7 @@ struct FileIndices {
     /// 第 N×1000 行的 start_byte，下标 N 对应行号 N×1000
     page_index: Vec<u64>,
     /// 文件总行数（也是下次增量加载的起始行号，exclusive）
-    end_line_index: u64,
+    end_line_index: u32,
     /// 上次加载结束的末尾字节位置（exclusive，即文件末尾）
     end_pos: u64,
 }
@@ -106,7 +102,7 @@ impl FileIndices {
 
     pub async fn query_by_time_range<R: Record>(
         &self, file_path: impl AsRef<Path>, start: &str, end: &str,
-    ) -> Result<Vec<(u64, R)>> {
+    ) -> Result<Vec<(u32, R)>> {
         let minute_start = as_minute(start);
         let minute_end = as_minute(end);
         let entries: Vec<_> = self.time_index.range(minute_start.to_string()..=minute_end.to_string()).collect();
@@ -134,8 +130,8 @@ impl FileIndices {
     }
 
     pub async fn query_by_line_range<R: Record>(
-        &self, file_path: impl AsRef<Path>, start_line: u64, end_line: u64,
-    ) -> Result<Vec<(u64, R)>> {
+        &self, file_path: impl AsRef<Path>, start_line: u32, end_line: u32,
+    ) -> Result<Vec<(u32, R)>> {
         let end_line_index = self.end_line_index;
         let actual_start = start_line.min(end_line_index);
         let actual_end = end_line.min(end_line_index);
@@ -147,7 +143,7 @@ impl FileIndices {
 
         let mut reader = LineReader::new(file_path, Some(start_byte), None).await?;
         let mut results = Vec::new();
-        let mut line_idx = page as u64 * 1000;
+        let mut line_idx = page as u32 * 1000;
 
         while let Some(line_with_pos) = reader.next_line().await? {
             if line_idx >= actual_end {
@@ -164,8 +160,8 @@ impl FileIndices {
     }
 
     pub async fn query_last_n<R: Record>(
-        &self, file_path: impl AsRef<Path>, n: u64,
-    ) -> Result<Vec<(u64, R)>> {
+        &self, file_path: impl AsRef<Path>, n: u32,
+    ) -> Result<Vec<(u32, R)>> {
         let end_line_index = self.end_line_index;
 
         if n == 0 || end_line_index == 0 {
@@ -182,7 +178,7 @@ impl FileIndices {
         for _ in 0..n {
             if let Some(line_with_pos) = reader.next_line().await? {
                 let record = serde_json::from_str::<R>(line_with_pos.line.as_str())?;
-                let line_index = end_line_index - results.len() as u64 - 1;
+                let line_index = end_line_index - results.len() as u32 - 1;
                 results.push_front((line_index, record));
             } else {
                 break;
@@ -195,20 +191,19 @@ impl FileIndices {
 
 type FileIndexLock = Arc<RwLock<FileIndices>>;
 
-pub struct FileIndexContext<Q,K,R,RR,P> {
-    _marker: PhantomData<(Q,R,RR)>,
+pub struct FileIndexContext<Q,K,R,P> {
+    _marker: PhantomData<(Q,R)>,
     index_map: DashMap<K, FileIndexLock>,
     obsolete_set: DashSet<K>,
     all_obsolete_set: DashSet<K>,
-    parser: P,
+    pub parser: P,
 }
 
-impl<Q,K,R,RR,P> FileIndexContext<Q,K,R,RR,P>
+impl<Q,K,R,P> FileIndexContext<Q,K,R,P>
 where
     K: Eq + Hash + Clone + Send + Sync,
     R: Record,
-    RR: Serialize,
-    P: FilePathGenerator<K> + QueryParser<Q,K> + RecordCombiner<K,R,RR>,
+    P: FilePathGenerator<K> + QueryParser<Q,K>,
 {
     pub fn new(parser: P) -> Self {
         Self {
@@ -245,6 +240,9 @@ where
 
     /// 确保索引已更新
     async fn ensure_updated(&self, key: &K) -> Result<()> {
+        // 确保索引已建立
+        self.get_lock(key);
+        // 检查是否需要更新索引
         if self.obsolete_set.remove(key).is_some() {
             // 如果更新完成后有新的全量变更标记
             if self.all_obsolete_set.remove(key).is_some() {
@@ -279,44 +277,39 @@ where
         indices.update_all_index::<R>(file_path).await
     }
 
-    async fn query_by_time_range(&self, key: &K, start: &str, end: &str) -> Result<Vec<(u64, Arc<RR>)>> {
-        self.get_lock(key);
+    async fn query_by_time_range(&self, key: &K, start: &str, end: &str) -> Result<Vec<(u32, R)>> {
         self.ensure_updated(key).await?;
         let file_path = self.parser.get_path(key).await?;
         let lock = self.get_lock(key);
         let indices = lock.read().await;
-        let raw = indices.query_by_time_range::<R>(file_path, start, end).await?;
-        Ok(raw.into_iter().map(|(idx, rec)| (idx, Arc::new(self.parser.combine_record(key, &rec)))).collect())
+        indices.query_by_time_range::<R>(file_path, start, end).await
     }
 
-    pub async fn query_all(&self, query: Q) -> Result<Vec<(u64, Arc<RR>)>> {
-        let key_with_range = self.parser.parse_query(query);
+    pub async fn query_all(&self, query: Q) -> Result<Vec<(K, Vec<(u32, R)>)>> {
+        let mut key_with_range = self.parser.parse_query(query);
         let mut results = Vec::new();
-        for (key, (start, end)) in key_with_range {
-            let mut part = self.query_by_time_range(&key, start.as_str(), end.as_str()).await?;
-            results.append(&mut part);
+        for (key, (start, end)) in key_with_range.drain(..) {
+            let part = self.query_by_time_range(&key, start.as_str(), end.as_str()).await?;
+            results.push((key,part));
         }
         Ok(results)
     }
 
-    pub async fn query_by_line_range(&self, key: &K, start_line: u64, end_line: u64) -> Result<Vec<(u64, Arc<RR>)>> {
-        self.get_lock(key);
+    pub async fn query_by_line_range(&self, key: &K, start_line: u32, end_line: u32) -> Result<Vec<(u32, R)>> {
         self.ensure_updated(key).await?;
         let file_path = self.parser.get_path(key).await?;
         let lock = self.get_lock(key);
         let indices = lock.read().await;
-        let raw = indices.query_by_line_range::<R>(file_path, start_line, end_line).await?;
-        Ok(raw.into_iter().map(|(idx, rec)| (idx, Arc::new(self.parser.combine_record(key, &rec)))).collect())
+        indices.query_by_line_range::<R>(file_path, start_line, end_line).await
     }
 
-    pub async fn query_last_n(&self, key: &K, n: u64) -> Result<Vec<(u64, Arc<RR>)>> {
+    pub async fn query_last_n(&self, key: &K, n: u32) -> Result<Vec<(u32, R)>> {
         self.get_lock(key);
         self.ensure_updated(key).await?;
         let file_path = self.parser.get_path(key).await?;
         let lock = self.get_lock(key);
         let indices = lock.read().await;
-        let raw = indices.query_last_n::<R>(file_path, n).await?;
-        Ok(raw.into_iter().map(|(idx, rec)| (idx, Arc::new(self.parser.combine_record(key, &rec)))).collect())
+        indices.query_last_n::<R>(file_path, n).await
     }
 }
 
