@@ -29,6 +29,10 @@ pub trait QueryParser<Q,K> {
     fn parse_query(&self, query: Q) -> Vec<(K, (String, String))>;
 }
 
+pub trait RecordCombiner<K, R, RR> {
+    fn combine_record(&self, key: &K, record: &R) -> RR;
+}
+
 #[derive(Debug, Clone)]
 struct FilePosition {
     pub start_pos: u64,
@@ -129,27 +133,30 @@ impl FileIndices {
         Ok(results)
     }
 
-    pub async fn query_by_line_range<R: Record>(
-        &self, file_path: impl AsRef<Path>, start_line: u32, end_line: u32,
+    pub async fn query_after<R: Record>(
+        &self, file_path: impl AsRef<Path>, line: u32, n: u32,
     ) -> Result<Vec<(u32, R)>> {
-        let end_line_index = self.end_line_index;
-        let actual_start = start_line.min(end_line_index);
-        let actual_end = end_line.min(end_line_index);
-        if actual_start >= actual_end {
-            return Ok(Vec::new());
+        if n == 0 || line >= self.end_line_index {
+            return if line >= self.end_line_index && self.end_line_index > 0 {
+                Err(crate::error::Error::ExternalError(
+                    format!("line {} out of range, end_line_index={}", line, self.end_line_index).into()
+                ))
+            } else {
+                Ok(Vec::new())
+            };
         }
-        let page = (actual_start / 1000) as usize;
-        let start_byte = self.page_index.get(page).copied().unwrap_or(0);
 
+        let page = (line / 1000) as usize;
+        let start_byte = self.page_index.get(page).copied().unwrap_or(0);
         let mut reader = LineReader::new(file_path, Some(start_byte), None).await?;
         let mut results = Vec::new();
         let mut line_idx = page as u32 * 1000;
 
         while let Some(line_with_pos) = reader.next_line().await? {
-            if line_idx >= actual_end {
+            if line_idx >= line + n {
                 break;
             }
-            if line_idx >= actual_start {
+            if line_idx >= line {
                 let record = serde_json::from_str::<R>(line_with_pos.line.as_str())?;
                 results.push((line_idx, record));
             }
@@ -159,51 +166,83 @@ impl FileIndices {
         Ok(results)
     }
 
-    pub async fn query_last_n<R: Record>(
-        &self, file_path: impl AsRef<Path>, n: u32,
+    pub async fn query_before<R: Record>(
+        &self, file_path: impl AsRef<Path>, line: u32, n: u32,
     ) -> Result<Vec<(u32, R)>> {
-        let end_line_index = self.end_line_index;
-
-        if n == 0 || end_line_index == 0 {
+        if n == 0 || self.end_line_index == 0 {
             return Ok(Vec::new());
         }
-
-        if n >= end_line_index {
-            return self.query_by_line_range::<R>(file_path, 0, end_line_index).await;
+        if line >= self.end_line_index {
+            return Err(crate::error::Error::ExternalError(
+                format!("line {} out of range, end_line_index={}", line, self.end_line_index).into()
+            ));
         }
 
-        let mut reader = ReverseLineReader::new(file_path, None, None).await?;
+        let page = (line / 1000) as usize;
+        let mut remaining = n;
         let mut results = LinkedList::new();
+        let mut page_idx = page;
 
-        for _ in 0..n {
-            if let Some(line_with_pos) = reader.next_line().await? {
-                let record = serde_json::from_str::<R>(line_with_pos.line.as_str())?;
-                let line_index = end_line_index - results.len() as u32 - 1;
-                results.push_front((line_index, record));
-            } else {
+        loop {
+            let page_end_line = self.end_line_index.min((page_idx as u32 + 1) * 1000);
+            let end_byte = self.page_index.get(page_idx + 1).copied().unwrap_or(self.end_pos);
+            let start_byte = self.page_index.get(page_idx).copied().unwrap_or(0);
+
+            let mut reader = ReverseLineReader::new(&file_path, Some(start_byte), Some(end_byte)).await?;
+            let mut cur_line = page_end_line;
+            while let Some(line_with_pos) = reader.next_line().await? {
+                cur_line -= 1;
+                if cur_line <= line {
+                    let record = serde_json::from_str::<R>(line_with_pos.line.as_str())?;
+                    results.push_front((cur_line, record));
+                    remaining -= 1;
+                    if remaining == 0 {
+                        return Ok(results.into_iter().collect());
+                    }
+                }
+            }
+
+            if page_idx == 0 {
                 break;
             }
+            page_idx -= 1;
         }
 
         Ok(results.into_iter().collect())
+    }
+
+    pub async fn query_first<R: Record>(
+        &self, file_path: impl AsRef<Path>, n: u32,
+    ) -> Result<Vec<(u32, R)>> {
+        self.query_after::<R>(file_path, 0, n).await
+    }
+
+    pub async fn query_last<R: Record>(
+        &self, file_path: impl AsRef<Path>, n: u32,
+    ) -> Result<Vec<(u32, R)>> {
+        if n == 0 || self.end_line_index == 0 {
+            return Ok(Vec::new());
+        }
+        self.query_before::<R>(file_path, self.end_line_index - 1, n).await
     }
 }
 
 type FileIndexLock = Arc<RwLock<FileIndices>>;
 
-pub struct FileIndexContext<Q,K,R,P> {
-    _marker: PhantomData<(Q,R)>,
+pub struct FileIndexContext<Q,K,R,RR,P> {
+    _marker: PhantomData<(Q,R,RR)>,
     index_map: DashMap<K, FileIndexLock>,
     obsolete_set: DashSet<K>,
     all_obsolete_set: DashSet<K>,
     pub parser: P,
 }
 
-impl<Q,K,R,P> FileIndexContext<Q,K,R,P>
+impl<Q,K,R,RR,P> FileIndexContext<Q,K,R,RR,P>
 where
     K: Eq + Hash + Clone + Send + Sync,
     R: Record,
-    P: FilePathGenerator<K> + QueryParser<Q,K>,
+    RR: Send + Sync,
+    P: FilePathGenerator<K> + QueryParser<Q,K> + RecordCombiner<K, R, RR>,
 {
     pub fn new(parser: P) -> Self {
         Self {
@@ -295,21 +334,44 @@ where
         Ok(results)
     }
 
-    pub async fn query_by_line_range(&self, key: &K, start_line: u32, end_line: u32) -> Result<Vec<(u32, R)>> {
-        self.ensure_updated(key).await?;
-        let file_path = self.parser.get_path(key).await?;
-        let lock = self.get_lock(key);
-        let indices = lock.read().await;
-        indices.query_by_line_range::<R>(file_path, start_line, end_line).await
-    }
-
-    pub async fn query_last_n(&self, key: &K, n: u32) -> Result<Vec<(u32, R)>> {
+    pub async fn query_after(&self, key: &K, line: u32, n: u32) -> Result<Vec<(u32, Arc<RR>)>> {
         self.get_lock(key);
         self.ensure_updated(key).await?;
         let file_path = self.parser.get_path(key).await?;
         let lock = self.get_lock(key);
         let indices = lock.read().await;
-        indices.query_last_n::<R>(file_path, n).await
+        let raw = indices.query_after::<R>(file_path, line, n).await?;
+        Ok(raw.into_iter().map(|(idx, rec)| (idx, Arc::new(self.parser.combine_record(key, &rec)))).collect())
+    }
+
+    pub async fn query_before(&self, key: &K, line: u32, n: u32) -> Result<Vec<(u32, Arc<RR>)>> {
+        self.get_lock(key);
+        self.ensure_updated(key).await?;
+        let file_path = self.parser.get_path(key).await?;
+        let lock = self.get_lock(key);
+        let indices = lock.read().await;
+        let raw = indices.query_before::<R>(file_path, line, n).await?;
+        Ok(raw.into_iter().map(|(idx, rec)| (idx, Arc::new(self.parser.combine_record(key, &rec)))).collect())
+    }
+
+    pub async fn query_first(&self, key: &K, n: u32) -> Result<Vec<(u32, Arc<RR>)>> {
+        self.get_lock(key);
+        self.ensure_updated(key).await?;
+        let file_path = self.parser.get_path(key).await?;
+        let lock = self.get_lock(key);
+        let indices = lock.read().await;
+        let raw = indices.query_first::<R>(file_path, n).await?;
+        Ok(raw.into_iter().map(|(idx, rec)| (idx, Arc::new(self.parser.combine_record(key, &rec)))).collect())
+    }
+
+    pub async fn query_last(&self, key: &K, n: u32) -> Result<Vec<(u32, Arc<RR>)>> {
+        self.get_lock(key);
+        self.ensure_updated(key).await?;
+        let file_path = self.parser.get_path(key).await?;
+        let lock = self.get_lock(key);
+        let indices = lock.read().await;
+        let raw = indices.query_last::<R>(file_path, n).await?;
+        Ok(raw.into_iter().map(|(idx, rec)| (idx, Arc::new(self.parser.combine_record(key, &rec)))).collect())
     }
 }
 
@@ -404,8 +466,8 @@ mod tests {
         // query range excludes A (line 0), includes B (line 1)
         let results = indexer.query_all((format!("{} 09:00:00", date), format!("{} 13:00:00", date))).await.unwrap();
         assert_eq!(results.len(), 1);
-        assert_eq!(results[0].0, 1);
-        assert_eq!(results[0].1.content.as_str(), "B");
+        assert_eq!(results[0].1[0].0, 1);
+        assert_eq!(results[0].1[0].1.content.as_str(), "B");
 
         // write C (in range) after MemoryIndexer created
         append_jsonl(dir.path(), date, r#"{"content":"C","time":"2026-06-24 11:00:00"}"#).await;
@@ -413,11 +475,12 @@ mod tests {
         // mark + query — incremental load picks up C (line 2)
         indexer.mark_obsolete(&date.to_string());
         let results = indexer.query_all((format!("{} 09:00:00", date), format!("{} 13:00:00", date))).await.unwrap();
-        assert_eq!(results.len(), 2);
-        assert_eq!(results[0].0, 1);
-        assert_eq!(results[0].1.content.as_str(), "B");
-        assert_eq!(results[1].0, 2);
-        assert_eq!(results[1].1.content.as_str(), "C");
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].1.len(), 2);
+        assert_eq!(results[0].1[0].0, 1);
+        assert_eq!(results[0].1[0].1.content.as_str(), "B");
+        assert_eq!(results[0].1[1].0, 2);
+        assert_eq!(results[0].1[1].1.content.as_str(), "C");
 
         // delete file, write D(before start), E(in range), F(after end)
         remove_file(&file_path).await.unwrap();
@@ -429,12 +492,12 @@ mod tests {
         indexer.mark_all_obsolete(&date.to_string());
         let results = indexer.query_all((format!("{} 09:00:00", date), format!("{} 13:00:00", date))).await.unwrap();
         assert_eq!(results.len(), 1);
-        assert_eq!(results[0].0, 1);
-        assert_eq!(results[0].1.content.as_str(), "E");
+        assert_eq!(results[0].1[0].0, 1);
+        assert_eq!(results[0].1[0].1.content.as_str(), "E");
     }
 
     #[tokio::test]
-    async fn test_query_by_line_range() {
+    async fn test_query_after() {
         let dir = tempfile::tempdir().unwrap();
         let date = "2026-07-19";
         let file_path = get_path(dir.path(), date).await.unwrap();
@@ -450,7 +513,7 @@ mod tests {
         let parser = TestRecordParser { root_dir: dir.path().to_path_buf() };
         let indexer = FileIndexContext::new(parser);
 
-        let results = indexer.query_by_line_range(&date.to_string(), 2, 5).await.unwrap();
+        let results = indexer.query_after(&date.to_string(), 2, 3).await.unwrap();
         assert_eq!(results.len(), 3);
         assert_eq!(results[0].0, 2);
         assert_eq!(results[0].1.content.as_str(), "L2");
@@ -461,7 +524,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_query_by_line_range_empty() {
+    async fn test_query_after_zero() {
         let dir = tempfile::tempdir().unwrap();
         let date = "2026-07-19";
         let file_path = get_path(dir.path(), date).await.unwrap();
@@ -476,17 +539,13 @@ mod tests {
         let parser = TestRecordParser { root_dir: dir.path().to_path_buf() };
         let indexer = FileIndexContext::new(parser);
 
-        // 空区间
-        let results = indexer.query_by_line_range(&date.to_string(), 3, 3).await.unwrap();
-        assert_eq!(results.len(), 0);
-
-        // start > end
-        let results = indexer.query_by_line_range(&date.to_string(), 5, 3).await.unwrap();
+        // n=0 返回空
+        let results = indexer.query_after(&date.to_string(), 2, 0).await.unwrap();
         assert_eq!(results.len(), 0);
     }
 
     #[tokio::test]
-    async fn test_query_by_line_range_oob() {
+    async fn test_query_after_short() {
         let dir = tempfile::tempdir().unwrap();
         let date = "2026-07-19";
         let file_path = get_path(dir.path(), date).await.unwrap();
@@ -502,19 +561,15 @@ mod tests {
         let parser = TestRecordParser { root_dir: dir.path().to_path_buf() };
         let indexer = FileIndexContext::new(parser);
 
-        // end 超出范围 → 截断到实际行数
-        let results = indexer.query_by_line_range(&date.to_string(), 5, 20).await.unwrap();
+        // n 超出可用范围 → 返回实际可用行数
+        let results = indexer.query_after(&date.to_string(), 5, 20).await.unwrap();
         assert_eq!(results.len(), 5);
         assert_eq!(results[0].0, 5);
         assert_eq!(results[4].0, 9);
-
-        // 全部超出
-        let results = indexer.query_by_line_range(&date.to_string(), 10, 20).await.unwrap();
-        assert_eq!(results.len(), 0);
     }
 
     #[tokio::test]
-    async fn test_query_last_n() {
+    async fn test_query_after_oob() {
         let dir = tempfile::tempdir().unwrap();
         let date = "2026-07-19";
         let file_path = get_path(dir.path(), date).await.unwrap();
@@ -530,7 +585,29 @@ mod tests {
         let parser = TestRecordParser { root_dir: dir.path().to_path_buf() };
         let indexer = FileIndexContext::new(parser);
 
-        let results = indexer.query_last_n(&date.to_string(), 3).await.unwrap();
+        // line >= end_line_index → Err
+        let results = indexer.query_after(&date.to_string(), 10, 5).await;
+        assert!(results.is_err());
+    }
+
+    #[tokio::test]
+    async fn test_query_before() {
+        let dir = tempfile::tempdir().unwrap();
+        let date = "2026-07-19";
+        let file_path = get_path(dir.path(), date).await.unwrap();
+        if file_path.exists() {
+            remove_file(&file_path).await.unwrap();
+        }
+
+        for i in 0..10 {
+            let h = 8 + i;
+            append_jsonl(dir.path(), date, &format!(r#"{{"content":"L{}","time":"2026-07-19 {:02}:00:00"}}"#, i, h)).await;
+        }
+
+        let parser = TestRecordParser { root_dir: dir.path().to_path_buf() };
+        let indexer = FileIndexContext::new(parser);
+
+        let results = indexer.query_before(&date.to_string(), 9, 3).await.unwrap();
         assert_eq!(results.len(), 3);
         assert_eq!(results[0].0, 7);
         assert_eq!(results[0].1.content.as_str(), "L7");
@@ -541,7 +618,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_query_last_n_overflow() {
+    async fn test_query_before_short() {
         let dir = tempfile::tempdir().unwrap();
         let date = "2026-07-19";
         let file_path = get_path(dir.path(), date).await.unwrap();
@@ -558,14 +635,90 @@ mod tests {
         let indexer = FileIndexContext::new(parser);
 
         // n > 总行数 → 返回全部
-        let results = indexer.query_last_n(&date.to_string(), 100).await.unwrap();
+        let results = indexer.query_before(&date.to_string(), 4, 100).await.unwrap();
         assert_eq!(results.len(), 5);
         assert_eq!(results[0].0, 0);
         assert_eq!(results[4].0, 4);
 
         // n = 0
-        let results = indexer.query_last_n(&date.to_string(), 0).await.unwrap();
+        let results = indexer.query_before(&date.to_string(), 4, 0).await.unwrap();
         assert_eq!(results.len(), 0);
+    }
+
+    #[tokio::test]
+    async fn test_query_before_oob() {
+        let dir = tempfile::tempdir().unwrap();
+        let date = "2026-07-19";
+        let file_path = get_path(dir.path(), date).await.unwrap();
+        if file_path.exists() {
+            remove_file(&file_path).await.unwrap();
+        }
+
+        for i in 0..10 {
+            let h = 8 + i;
+            append_jsonl(dir.path(), date, &format!(r#"{{"content":"L{}","time":"2026-07-19 {:02}:00:00"}}"#, i, h)).await;
+        }
+
+        let parser = TestRecordParser { root_dir: dir.path().to_path_buf() };
+        let indexer = FileIndexContext::new(parser);
+
+        // line >= end_line_index → Err
+        let results = indexer.query_before(&date.to_string(), 10, 5).await;
+        assert!(results.is_err());
+    }
+
+    #[tokio::test]
+    async fn test_query_first() {
+        let dir = tempfile::tempdir().unwrap();
+        let date = "2026-07-19";
+        let file_path = get_path(dir.path(), date).await.unwrap();
+        if file_path.exists() {
+            remove_file(&file_path).await.unwrap();
+        }
+
+        for i in 0..10 {
+            let h = 8 + i;
+            append_jsonl(dir.path(), date, &format!(r#"{{"content":"L{}","time":"2026-07-19 {:02}:00:00"}}"#, i, h)).await;
+        }
+
+        let parser = TestRecordParser { root_dir: dir.path().to_path_buf() };
+        let indexer = FileIndexContext::new(parser);
+
+        let results = indexer.query_first(&date.to_string(), 3).await.unwrap();
+        assert_eq!(results.len(), 3);
+        assert_eq!(results[0].0, 0);
+        assert_eq!(results[0].1.content.as_str(), "L0");
+        assert_eq!(results[1].0, 1);
+        assert_eq!(results[1].1.content.as_str(), "L1");
+        assert_eq!(results[2].0, 2);
+        assert_eq!(results[2].1.content.as_str(), "L2");
+    }
+
+    #[tokio::test]
+    async fn test_query_last() {
+        let dir = tempfile::tempdir().unwrap();
+        let date = "2026-07-19";
+        let file_path = get_path(dir.path(), date).await.unwrap();
+        if file_path.exists() {
+            remove_file(&file_path).await.unwrap();
+        }
+
+        for i in 0..10 {
+            let h = 8 + i;
+            append_jsonl(dir.path(), date, &format!(r#"{{"content":"L{}","time":"2026-07-19 {:02}:00:00"}}"#, i, h)).await;
+        }
+
+        let parser = TestRecordParser { root_dir: dir.path().to_path_buf() };
+        let indexer = FileIndexContext::new(parser);
+
+        let results = indexer.query_last(&date.to_string(), 3).await.unwrap();
+        assert_eq!(results.len(), 3);
+        assert_eq!(results[0].0, 7);
+        assert_eq!(results[0].1.content.as_str(), "L7");
+        assert_eq!(results[1].0, 8);
+        assert_eq!(results[1].1.content.as_str(), "L8");
+        assert_eq!(results[2].0, 9);
+        assert_eq!(results[2].1.content.as_str(), "L9");
     }
 
     #[tokio::test]
@@ -588,7 +741,7 @@ mod tests {
         let indexer = FileIndexContext::new(parser);
 
         // 触发全量更新
-        let results = indexer.query_by_line_range(&date.to_string(), 0, 1005).await.unwrap();
+        let results = indexer.query_after(&date.to_string(), 0, 1005).await.unwrap();
         assert_eq!(results.len(), 1005);
 
         // 验证 page 索引: page 0 (line 0), page 1 (line 1000)
@@ -608,7 +761,7 @@ mod tests {
 
         // 增量更新
         indexer.mark_obsolete(&date.to_string());
-        let results = indexer.query_last_n(&date.to_string(), 10).await.unwrap();
+        let results = indexer.query_last(&date.to_string(), 10).await.unwrap();
         assert_eq!(results.len(), 10);
         assert_eq!(results[0].0, 1005);
         assert_eq!(results[9].0, 1014);
@@ -628,7 +781,7 @@ mod tests {
         }
 
         indexer.mark_obsolete(&date.to_string());
-        let results = indexer.query_by_line_range(&date.to_string(), 2000, 2005).await.unwrap();
+        let results = indexer.query_after(&date.to_string(), 2000, 5).await.unwrap();
         assert_eq!(results.len(), 5);
         assert_eq!(results[0].0, 2000);
 
@@ -660,7 +813,7 @@ mod tests {
         let indexer = FileIndexContext::new(parser);
 
         // 触发全量更新
-        let results = indexer.query_by_line_range(&date.to_string(), 0, 3005).await.unwrap();
+        let results = indexer.query_after(&date.to_string(), 0, 3005).await.unwrap();
         assert_eq!(results.len(), 3005);
 
         // page 索引4个: 0,1,2,3
@@ -671,13 +824,13 @@ mod tests {
         }
 
         // 跨页范围查询
-        let results = indexer.query_by_line_range(&date.to_string(), 1500, 2500).await.unwrap();
+        let results = indexer.query_after(&date.to_string(), 1500, 1000).await.unwrap();
         assert_eq!(results.len(), 1000);
         assert_eq!(results[0].0, 1500);
         assert_eq!(results[999].0, 2499);
 
         // 最后几行
-        let results = indexer.query_last_n(&date.to_string(), 5).await.unwrap();
+        let results = indexer.query_last(&date.to_string(), 5).await.unwrap();
         assert_eq!(results.len(), 5);
         assert_eq!(results[0].0, 3000);
         assert_eq!(results[4].0, 3004);
