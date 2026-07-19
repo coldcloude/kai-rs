@@ -1,5 +1,6 @@
 pub mod error;
 pub mod reverse_line_reader;
+pub mod line_reader;
 pub mod index;
 
 pub use error::Error;
