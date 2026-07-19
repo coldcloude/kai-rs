@@ -10,6 +10,8 @@ use std::sync::Arc;
 use tokio::sync::RwLock;
 use std::collections::{BTreeMap, LinkedList};
 
+use kai_date::as_minute;
+
 use crate::error::Result;
 use crate::LineReader;
 use crate::ReverseLineReader;
@@ -128,7 +130,7 @@ where
         let mut ln_index = indices.end_line_index;
         while let Some(line_with_pos) = reader.next_line().await? {
             let record = serde_json::from_str::<R>(line_with_pos.line.as_str())?;
-            match indices.time_index.entry(record.time().to_string()) {
+            match indices.time_index.entry(as_minute(record.time()).to_string()) {
                 Entry::Occupied(mut entry) => {
                     let min_start = entry.get().start_pos.min(line_with_pos.start_pos);
                     let max_end = entry.get().end_pos.max(line_with_pos.end_pos);
@@ -181,57 +183,48 @@ where
         Self::update_forward_lines(&mut indices, self.parser.get_path(key).await?, 0).await
     }
 
-    async fn query_reverse(&self, key: &K, start: &str, end: &str) -> Result<LinkedList<(u64, Arc<RR>)>> {
+    async fn query_by_time_range(&self, key: &K, start: &str, end: &str) -> Result<Vec<(u64, Arc<RR>)>> {
         self.get_lock(key);
         self.ensure_updated(key).await?;
 
-        let mut results = LinkedList::new();
         let lock = self.get_lock(key);
         let indices = lock.read().await;
-        let mut start_pos: Option<u64> = None;
-        let mut end_pos: Option<u64> = None;
-        if let Some((_, position)) = indices.time_index.range(start.to_string()..=end.to_string()).next() {
-            start_pos = Some(position.start_pos);
-        }
-        if let Some((_, position)) = indices.time_index.range(start.to_string()..=end.to_string()).next_back() {
-            end_pos = Some(position.end_pos);
-        }
-        if start_pos.is_some() && end_pos.is_some() {
-            let file_path = self.parser.get_path(key).await?;
-            let mut reader = ReverseLineReader::new(file_path, start_pos, end_pos).await?;
 
-            let line_index_by_time: BTreeMap<&str, u64> = indices.time_index.range(start.to_string()..=end.to_string())
-                .map(|(t, pos)| (t.as_str(), pos.start_line_index))
-                .collect();
+        let minute_start = as_minute(start);
+        let minute_end = as_minute(end);
+        let entries: Vec<_> = indices.time_index.range(minute_start.to_string()..=minute_end.to_string()).collect();
 
-            while let Some(line_with_pos) = reader.next_line().await? {
-                let parsed = serde_json::from_str::<R>(line_with_pos.line.as_str())?;
-                let line_index = line_index_by_time.get(parsed.time()).copied().unwrap_or(0);
-                let record = self.parser.combine_record(key, &parsed);
-                results.push_front((line_index, Arc::new(record)));
+        let (Some(first), Some(last)) = (entries.first(), entries.last()) else {
+            return Ok(Vec::new());
+        };
+        let start_byte = first.1.start_pos;
+        let end_byte = last.1.end_pos;
+        let start_line = first.1.start_line_index;
+        drop(indices);
+
+        let file_path = self.parser.get_path(key).await?;
+        let mut reader = LineReader::new(file_path, Some(start_byte), Some(end_byte)).await?;
+        let mut results = Vec::new();
+        let mut line_idx = start_line;
+
+        while let Some(line_with_pos) = reader.next_line().await? {
+            let record = serde_json::from_str::<R>(line_with_pos.line.as_str())?;
+            if record.time() >= start && record.time() <= end {
+                let record = self.parser.combine_record(key, &record);
+                results.push((line_idx, Arc::new(record)));
             }
+            line_idx += 1;
         }
+
         Ok(results)
     }
 
     pub async fn query_all(&self, query: Q) -> Result<Vec<(u64, Arc<RR>)>> {
         let key_with_range = self.parser.parse_query(query);
-        let mut results_list = LinkedList::new();
+        let mut results = Vec::new();
         for (key, (start, end)) in key_with_range {
-            let results = self.query_reverse(&key, start.as_str(), end.as_str()).await?;
-            results_list.push_back(results);
-        }
-        //先计算总数
-        let mut len = 0;
-        for results in results_list.iter() {
-            len += results.len();
-        }
-        //按总长建结果数组
-        let mut results = Vec::with_capacity(len);
-        while let Some(mut records) = results_list.pop_front() {
-            while let Some(record) = records.pop_front() {
-                results.push(record);
-            }
+            let mut part = self.query_by_time_range(&key, start.as_str(), end.as_str()).await?;
+            results.append(&mut part);
         }
         Ok(results)
     }
