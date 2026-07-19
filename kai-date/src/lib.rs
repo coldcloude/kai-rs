@@ -20,6 +20,10 @@ pub fn as_year(time: &str) -> &str {
     time[0..4].as_ref()
 }
 
+pub fn as_minute(time: &str) -> &str {
+    time[..16].as_ref()
+}
+
 pub fn get_internal_dates(start: &str, end: &str) -> Result<Vec<String>> {
     if start > end {
         return Err(Error::InvalidTimeRange(start.to_string(), end.to_string()));
@@ -74,6 +78,13 @@ mod tests {
     fn test_parse_year_from_date_time() {
         assert_eq!(as_year("2026-06-24"), "2026");
         assert_eq!(as_year("2026-01-01 00:00:00"), "2026");
+    }
+
+    #[test]
+    fn test_as_minute() {
+        assert_eq!(as_minute("2026-06-24 10:30:45"), "2026-06-24 10:30");
+        assert_eq!(as_minute("2026-01-01 00:00:00"), "2026-01-01 00:00");
+        assert_eq!(as_minute("2026-12-31 23:59:59"), "2026-12-31 23:59");
     }
 
     #[test]
