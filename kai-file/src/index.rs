@@ -52,6 +52,147 @@ struct FileIndices {
     end_pos: u64,
 }
 
+impl FileIndices {
+    async fn update_forward_lines<R: Record>(&mut self, file_path: impl AsRef<Path>) -> Result<()> {
+        let mut reader = LineReader::new(file_path, Some(self.end_pos), None).await?;
+        let mut ln_index = self.end_line_index;
+        while let Some(line_with_pos) = reader.next_line().await? {
+            let record = serde_json::from_str::<R>(line_with_pos.line.as_str())?;
+            match self.time_index.entry(as_minute(record.time()).to_string()) {
+                Entry::Occupied(mut entry) => {
+                    let min_start = entry.get().start_pos.min(line_with_pos.start_pos);
+                    let max_end = entry.get().end_pos.max(line_with_pos.end_pos);
+                    let min_line = entry.get().start_line_index.min(ln_index);
+                    let max_line = entry.get().end_line_index.max(ln_index + 1);
+                    entry.get_mut().start_pos = min_start;
+                    entry.get_mut().end_pos = max_end;
+                    entry.get_mut().start_line_index = min_line;
+                    entry.get_mut().end_line_index = max_line;
+                }
+                Entry::Vacant(entry) => {
+                    entry.insert(FilePosition {
+                        start_pos: line_with_pos.start_pos,
+                        end_pos: line_with_pos.end_pos,
+                        start_line_index: ln_index,
+                        end_line_index: ln_index + 1,
+                    });
+                }
+            }
+            if ln_index % 1000 == 0 {
+                let page = (ln_index / 1000) as usize;
+                if page >= self.page_index.len() {
+                    self.page_index.resize(page + 1, 0);
+                }
+                self.page_index[page] = line_with_pos.start_pos;
+            }
+            ln_index += 1;
+        }
+        self.end_line_index = ln_index;
+        self.end_pos = reader.current_pos();
+        Ok(())
+    }
+
+    pub async fn update_index<R: Record>(&mut self, file_path: impl AsRef<Path>) -> Result<()> {
+        self.update_forward_lines::<R>(file_path).await
+    }
+
+    pub async fn update_all_index<R: Record>(&mut self, file_path: impl AsRef<Path>) -> Result<()> {
+        self.time_index.clear();
+        self.page_index.clear();
+        self.end_line_index = 0;
+        self.end_pos = 0;
+        self.update_forward_lines::<R>(file_path).await
+    }
+
+    pub async fn query_by_time_range<R: Record>(
+        &self, file_path: impl AsRef<Path>, start: &str, end: &str,
+    ) -> Result<Vec<(u64, R)>> {
+        let minute_start = as_minute(start);
+        let minute_end = as_minute(end);
+        let entries: Vec<_> = self.time_index.range(minute_start.to_string()..=minute_end.to_string()).collect();
+
+        let (Some(first), Some(last)) = (entries.first(), entries.last()) else {
+            return Ok(Vec::new());
+        };
+        let start_byte = first.1.start_pos;
+        let end_byte = last.1.end_pos;
+        let start_line = first.1.start_line_index;
+
+        let mut reader = LineReader::new(file_path, Some(start_byte), Some(end_byte)).await?;
+        let mut results = Vec::new();
+        let mut line_idx = start_line;
+
+        while let Some(line_with_pos) = reader.next_line().await? {
+            let record = serde_json::from_str::<R>(line_with_pos.line.as_str())?;
+            if record.time() >= start && record.time() <= end {
+                results.push((line_idx, record));
+            }
+            line_idx += 1;
+        }
+
+        Ok(results)
+    }
+
+    pub async fn query_by_line_range<R: Record>(
+        &self, file_path: impl AsRef<Path>, start_line: u64, end_line: u64,
+    ) -> Result<Vec<(u64, R)>> {
+        let end_line_index = self.end_line_index;
+        let actual_start = start_line.min(end_line_index);
+        let actual_end = end_line.min(end_line_index);
+        if actual_start >= actual_end {
+            return Ok(Vec::new());
+        }
+        let page = (actual_start / 1000) as usize;
+        let start_byte = self.page_index.get(page).copied().unwrap_or(0);
+
+        let mut reader = LineReader::new(file_path, Some(start_byte), None).await?;
+        let mut results = Vec::new();
+        let mut line_idx = page as u64 * 1000;
+
+        while let Some(line_with_pos) = reader.next_line().await? {
+            if line_idx >= actual_end {
+                break;
+            }
+            if line_idx >= actual_start {
+                let record = serde_json::from_str::<R>(line_with_pos.line.as_str())?;
+                results.push((line_idx, record));
+            }
+            line_idx += 1;
+        }
+
+        Ok(results)
+    }
+
+    pub async fn query_last_n<R: Record>(
+        &self, file_path: impl AsRef<Path>, n: u64,
+    ) -> Result<Vec<(u64, R)>> {
+        let end_line_index = self.end_line_index;
+
+        if n == 0 || end_line_index == 0 {
+            return Ok(Vec::new());
+        }
+
+        if n >= end_line_index {
+            return self.query_by_line_range::<R>(file_path, 0, end_line_index).await;
+        }
+
+        let mut reader = ReverseLineReader::new(file_path, None, None).await?;
+        let mut results = LinkedList::new();
+
+        for _ in 0..n {
+            if let Some(line_with_pos) = reader.next_line().await? {
+                let record = serde_json::from_str::<R>(line_with_pos.line.as_str())?;
+                let line_index = end_line_index - results.len() as u64 - 1;
+                results.push_front((line_index, record));
+            } else {
+                break;
+            }
+        }
+
+        Ok(results.into_iter().collect())
+    }
+}
+
 type FileIndexLock = Arc<RwLock<FileIndices>>;
 
 pub struct FileIndexContext<Q,K,R,RR,P> {
@@ -89,6 +230,7 @@ where
     }
 
     fn get_lock(&self, key: &K) -> FileIndexLock {
+        // 确保 key 对应的索引已初始化（首次使用时标记为过期）
         self.index_map.entry(key.clone()).or_insert_with(|| {
             self.all_obsolete_set.insert(key.clone());
             self.obsolete_set.insert(key.clone());
@@ -101,10 +243,11 @@ where
         }).clone()
     }
 
-    /// 确保 key 对应的索引已初始化（首次使用时标记为过期）
+    /// 确保索引已更新
     async fn ensure_updated(&self, key: &K) -> Result<()> {
         if self.obsolete_set.remove(key).is_some() {
-            if self.all_obsolete_set.contains(key) {
+            // 如果更新完成后有新的全量变更标记
+            if self.all_obsolete_set.remove(key).is_some() {
                 if let Err(e) = self.update_all_index(key).await {
                     self.all_obsolete_set.insert(key.clone());
                     self.obsolete_set.insert(key.clone());
@@ -120,103 +263,30 @@ where
         Ok(())
     }
 
-    /// 正向读取文件行，更新 time_index 和 page_index
-    async fn update_forward_lines(
-        indices: &mut FileIndices,
-        file_path: impl AsRef<Path>,
-        start_pos: u64,
-    ) -> Result<()> {
-        let mut reader = LineReader::new(file_path, Some(start_pos), None).await?;
-        let mut ln_index = indices.end_line_index;
-        while let Some(line_with_pos) = reader.next_line().await? {
-            let record = serde_json::from_str::<R>(line_with_pos.line.as_str())?;
-            match indices.time_index.entry(as_minute(record.time()).to_string()) {
-                Entry::Occupied(mut entry) => {
-                    let min_start = entry.get().start_pos.min(line_with_pos.start_pos);
-                    let max_end = entry.get().end_pos.max(line_with_pos.end_pos);
-                    let min_line = entry.get().start_line_index.min(ln_index);
-                    let max_line = entry.get().end_line_index.max(ln_index + 1);
-                    entry.get_mut().start_pos = min_start;
-                    entry.get_mut().end_pos = max_end;
-                    entry.get_mut().start_line_index = min_line;
-                    entry.get_mut().end_line_index = max_line;
-                }
-                Entry::Vacant(entry) => {
-                    entry.insert(FilePosition {
-                        start_pos: line_with_pos.start_pos,
-                        end_pos: line_with_pos.end_pos,
-                        start_line_index: ln_index,
-                        end_line_index: ln_index + 1,
-                    });
-                }
-            }
-            if ln_index % 1000 == 0 {
-                let page = (ln_index / 1000) as usize;
-                if page >= indices.page_index.len() {
-                    indices.page_index.resize(page + 1, 0);
-                }
-                indices.page_index[page] = line_with_pos.start_pos;
-            }
-            ln_index += 1;
-        }
-        indices.end_line_index = ln_index;
-        indices.end_pos = reader.current_pos();
-        Ok(())
-    }
-
     /// 增量更新：从 end_pos 继续正向读取新行
     async fn update_index(&self, key: &K) -> Result<()> {
+        let file_path = self.parser.get_path(key).await?;
         let lock = self.get_lock(key);
         let mut indices = lock.write().await;
-        let start_pos = indices.end_pos;
-        Self::update_forward_lines(&mut indices, self.parser.get_path(key).await?, start_pos).await
+        indices.update_index::<R>(file_path).await
     }
 
     /// 全量重建：从头扫描，清空所有索引
     async fn update_all_index(&self, key: &K) -> Result<()> {
+        let file_path = self.parser.get_path(key).await?;
         let lock = self.get_lock(key);
         let mut indices = lock.write().await;
-        indices.time_index.clear();
-        indices.page_index.clear();
-        indices.end_line_index = 0;
-        indices.end_pos = 0;
-        Self::update_forward_lines(&mut indices, self.parser.get_path(key).await?, 0).await
+        indices.update_all_index::<R>(file_path).await
     }
 
     async fn query_by_time_range(&self, key: &K, start: &str, end: &str) -> Result<Vec<(u64, Arc<RR>)>> {
         self.get_lock(key);
         self.ensure_updated(key).await?;
-
+        let file_path = self.parser.get_path(key).await?;
         let lock = self.get_lock(key);
         let indices = lock.read().await;
-
-        let minute_start = as_minute(start);
-        let minute_end = as_minute(end);
-        let entries: Vec<_> = indices.time_index.range(minute_start.to_string()..=minute_end.to_string()).collect();
-
-        let (Some(first), Some(last)) = (entries.first(), entries.last()) else {
-            return Ok(Vec::new());
-        };
-        let start_byte = first.1.start_pos;
-        let end_byte = last.1.end_pos;
-        let start_line = first.1.start_line_index;
-        drop(indices);
-
-        let file_path = self.parser.get_path(key).await?;
-        let mut reader = LineReader::new(file_path, Some(start_byte), Some(end_byte)).await?;
-        let mut results = Vec::new();
-        let mut line_idx = start_line;
-
-        while let Some(line_with_pos) = reader.next_line().await? {
-            let record = serde_json::from_str::<R>(line_with_pos.line.as_str())?;
-            if record.time() >= start && record.time() <= end {
-                let record = self.parser.combine_record(key, &record);
-                results.push((line_idx, Arc::new(record)));
-            }
-            line_idx += 1;
-        }
-
-        Ok(results)
+        let raw = indices.query_by_time_range::<R>(file_path, start, end).await?;
+        Ok(raw.into_iter().map(|(idx, rec)| (idx, Arc::new(self.parser.combine_record(key, &rec)))).collect())
     }
 
     pub async fn query_all(&self, query: Q) -> Result<Vec<(u64, Arc<RR>)>> {
@@ -232,70 +302,21 @@ where
     pub async fn query_by_line_range(&self, key: &K, start_line: u64, end_line: u64) -> Result<Vec<(u64, Arc<RR>)>> {
         self.get_lock(key);
         self.ensure_updated(key).await?;
-
+        let file_path = self.parser.get_path(key).await?;
         let lock = self.get_lock(key);
         let indices = lock.read().await;
-        let end_line_index = indices.end_line_index;
-        let actual_start = start_line.min(end_line_index);
-        let actual_end = end_line.min(end_line_index);
-        if actual_start >= actual_end {
-            return Ok(Vec::new());
-        }
-        let page = (actual_start / 1000) as usize;
-        let start_byte = indices.page_index.get(page).copied().unwrap_or(0);
-        drop(indices);
-
-        let file_path = self.parser.get_path(key).await?;
-        let mut reader = LineReader::new(file_path, Some(start_byte), None).await?;
-        let mut results = Vec::new();
-        let mut line_idx = page as u64 * 1000;
-
-        while let Some(line_with_pos) = reader.next_line().await? {
-            if line_idx >= actual_end {
-                break;
-            }
-            if line_idx >= actual_start {
-                let record = serde_json::from_str::<R>(line_with_pos.line.as_str())?;
-                let record = self.parser.combine_record(key, &record);
-                results.push((line_idx, Arc::new(record)));
-            }
-            line_idx += 1;
-        }
-
-        Ok(results)
+        let raw = indices.query_by_line_range::<R>(file_path, start_line, end_line).await?;
+        Ok(raw.into_iter().map(|(idx, rec)| (idx, Arc::new(self.parser.combine_record(key, &rec)))).collect())
     }
 
     pub async fn query_last_n(&self, key: &K, n: u64) -> Result<Vec<(u64, Arc<RR>)>> {
         self.get_lock(key);
         self.ensure_updated(key).await?;
-
-        let lock = self.get_lock(key);
-        let end_line_index = lock.read().await.end_line_index;
-
-        if n == 0 || end_line_index == 0 {
-            return Ok(Vec::new());
-        }
-
-        if n >= end_line_index {
-            return self.query_by_line_range(key, 0, end_line_index).await;
-        }
-
         let file_path = self.parser.get_path(key).await?;
-        let mut reader = ReverseLineReader::new(file_path, None, None).await?;
-        let mut results = LinkedList::new();
-
-        for _ in 0..n {
-            if let Some(line_with_pos) = reader.next_line().await? {
-                let record = serde_json::from_str::<R>(line_with_pos.line.as_str())?;
-                let record = self.parser.combine_record(key, &record);
-                let line_index = end_line_index - results.len() as u64 - 1;
-                results.push_front((line_index, Arc::new(record)));
-            } else {
-                break;
-            }
-        }
-
-        Ok(results.into_iter().collect())
+        let lock = self.get_lock(key);
+        let indices = lock.read().await;
+        let raw = indices.query_last_n::<R>(file_path, n).await?;
+        Ok(raw.into_iter().map(|(idx, rec)| (idx, Arc::new(self.parser.combine_record(key, &rec)))).collect())
     }
 }
 
