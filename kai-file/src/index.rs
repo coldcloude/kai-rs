@@ -44,8 +44,8 @@ struct FileIndices {
     time_index: BTreeMap<String, FilePosition>,
     /// 第 N×1000 行的 start_byte，下标 N 对应行号 N×1000
     page_index: Vec<u64>,
-    /// 文件总行数（也是下次增量加载的起始行号）
-    line_count: u64,
+    /// 文件总行数（也是下次增量加载的起始行号，exclusive）
+    end_line_index: u64,
     /// 上次加载结束的末尾字节位置（exclusive，即文件末尾）
     end_pos: u64,
 }
@@ -93,7 +93,7 @@ where
             Arc::new(RwLock::new(FileIndices {
                 time_index: BTreeMap::new(),
                 page_index: Vec::new(),
-                line_count: 0,
+                end_line_index: 0,
                 end_pos: 0,
             }))
         }).clone()
@@ -125,7 +125,7 @@ where
         start_pos: u64,
     ) -> Result<()> {
         let mut reader = LineReader::new(file_path, Some(start_pos), None).await?;
-        let mut ln_index = indices.line_count;
+        let mut ln_index = indices.end_line_index;
         while let Some(line_with_pos) = reader.next_line().await? {
             let record = serde_json::from_str::<R>(line_with_pos.line.as_str())?;
             match indices.time_index.entry(record.time().to_string()) {
@@ -157,7 +157,7 @@ where
             }
             ln_index += 1;
         }
-        indices.line_count = ln_index;
+        indices.end_line_index = ln_index;
         indices.end_pos = reader.current_pos();
         Ok(())
     }
@@ -176,7 +176,7 @@ where
         let mut indices = lock.write().await;
         indices.time_index.clear();
         indices.page_index.clear();
-        indices.line_count = 0;
+        indices.end_line_index = 0;
         indices.end_pos = 0;
         Self::update_forward_lines(&mut indices, self.parser.get_path(key).await?, 0).await
     }
@@ -242,9 +242,9 @@ where
 
         let lock = self.get_lock(key);
         let indices = lock.read().await;
-        let line_count = indices.line_count;
-        let actual_start = start_line.min(line_count);
-        let actual_end = end_line.min(line_count);
+        let end_line_index = indices.end_line_index;
+        let actual_start = start_line.min(end_line_index);
+        let actual_end = end_line.min(end_line_index);
         if actual_start >= actual_end {
             return Ok(Vec::new());
         }
@@ -277,14 +277,14 @@ where
         self.ensure_updated(key).await?;
 
         let lock = self.get_lock(key);
-        let line_count = lock.read().await.line_count;
+        let end_line_index = lock.read().await.end_line_index;
 
-        if n == 0 || line_count == 0 {
+        if n == 0 || end_line_index == 0 {
             return Ok(Vec::new());
         }
 
-        if n >= line_count {
-            return self.query_by_line_range(key, 0, line_count).await;
+        if n >= end_line_index {
+            return self.query_by_line_range(key, 0, end_line_index).await;
         }
 
         let file_path = self.parser.get_path(key).await?;
@@ -295,7 +295,7 @@ where
             if let Some(line_with_pos) = reader.next_line().await? {
                 let record = serde_json::from_str::<R>(line_with_pos.line.as_str())?;
                 let record = self.parser.combine_record(key, &record);
-                let line_index = line_count - results.len() as u64 - 1;
+                let line_index = end_line_index - results.len() as u64 - 1;
                 results.push_front((line_index, Arc::new(record)));
             } else {
                 break;
@@ -589,7 +589,7 @@ mod tests {
             let lock = indexer.index_map.get(&date.to_string()).unwrap();
             let indices = lock.read().await;
             assert_eq!(indices.page_index.len(), 2);
-            assert_eq!(indices.line_count, 1005);
+            assert_eq!(indices.end_line_index, 1005);
         }
 
         // 追加10行（总1015）
