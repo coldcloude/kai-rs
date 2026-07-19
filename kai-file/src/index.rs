@@ -44,12 +44,10 @@ struct FileIndices {
     time_index: BTreeMap<String, FilePosition>,
     /// 第 N×1000 行的 start_byte，下标 N 对应行号 N×1000
     page_index: Vec<u64>,
-    /// 文件总行数
+    /// 文件总行数（也是下次增量加载的起始行号）
     line_count: u64,
-    /// 上次增量加载结束的字节位置
-    last_pos: u64,
-    /// 上次增量加载结束时的累计行数
-    last_line_index: u64,
+    /// 上次加载结束的末尾字节位置（exclusive，即文件末尾）
+    end_pos: u64,
 }
 
 type FileIndexLock = Arc<RwLock<FileIndices>>;
@@ -96,8 +94,7 @@ where
                 time_index: BTreeMap::new(),
                 page_index: Vec::new(),
                 line_count: 0,
-                last_pos: 0,
-                last_line_index: 0,
+                end_pos: 0,
             }))
         }).clone()
     }
@@ -128,7 +125,7 @@ where
         start_pos: u64,
     ) -> Result<()> {
         let mut reader = LineReader::new(file_path, Some(start_pos), None).await?;
-        let mut ln_index = indices.last_line_index;
+        let mut ln_index = indices.line_count;
         while let Some(line_with_pos) = reader.next_line().await? {
             let record = serde_json::from_str::<R>(line_with_pos.line.as_str())?;
             match indices.time_index.entry(record.time().to_string()) {
@@ -161,16 +158,15 @@ where
             ln_index += 1;
         }
         indices.line_count = ln_index;
-        indices.last_line_index = ln_index;
-        indices.last_pos = reader.current_pos();
+        indices.end_pos = reader.current_pos();
         Ok(())
     }
 
-    /// 增量更新：从 last_pos 继续正向读取新行
+    /// 增量更新：从 end_pos 继续正向读取新行
     async fn update_index(&self, key: &K) -> Result<()> {
         let lock = self.get_lock(key);
         let mut indices = lock.write().await;
-        let start_pos = indices.last_pos;
+        let start_pos = indices.end_pos;
         Self::update_forward_lines(&mut indices, self.parser.get_path(key).await?, start_pos).await
     }
 
@@ -181,8 +177,7 @@ where
         indices.time_index.clear();
         indices.page_index.clear();
         indices.line_count = 0;
-        indices.last_pos = 0;
-        indices.last_line_index = 0;
+        indices.end_pos = 0;
         Self::update_forward_lines(&mut indices, self.parser.get_path(key).await?, 0).await
     }
 
