@@ -91,6 +91,7 @@ where
 
     fn get_lock(&self, key: &K) -> FileIndexLock {
         let lock = self.position_map_map.entry(key.clone()).or_insert_with(|| {
+            // 新创建的 BTree：标记为需要全量加载
             self.all_obsolete_set.insert(key.clone());
             self.obsolete_set.insert(key.clone());
             Arc::new(RwLock::new(BTreeMap::new()))
@@ -155,6 +156,7 @@ where
         }
 
         *line_count_guard = line_index;
+        *last_line_index_guard = line_index;
         *last_pos_guard = reader.current_pos();
 
         Ok(())
