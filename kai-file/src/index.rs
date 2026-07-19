@@ -7,7 +7,7 @@ use std::hash::Hash;
 use std::marker::PhantomData;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use tokio::sync::{RwLock, RwLockWriteGuard};
+use tokio::sync::RwLock;
 use std::collections::{BTreeMap, LinkedList};
 
 use crate::error::Result;
@@ -39,18 +39,27 @@ struct FilePosition {
     pub end_line_index: u64,
 }
 
-type FileIndexLock = Arc<RwLock<BTreeMap<String, FilePosition>>>;
+struct FileIndices {
+    /// 时间→位置的索引
+    time_index: BTreeMap<String, FilePosition>,
+    /// 第 N×1000 行的 start_byte，下标 N 对应行号 N×1000
+    page_index: Vec<u64>,
+    /// 文件总行数
+    line_count: u64,
+    /// 上次增量加载结束的字节位置
+    last_pos: u64,
+    /// 上次增量加载结束时的累计行数
+    last_line_index: u64,
+}
+
+type FileIndexLock = Arc<RwLock<FileIndices>>;
 
 pub struct FileIndexContext<Q,K,R,RR,P> {
     _marker: PhantomData<(Q,R,RR)>,
-    position_map_map: DashMap<K, FileIndexLock>,
+    index_map: DashMap<K, FileIndexLock>,
     obsolete_set: DashSet<K>,
     all_obsolete_set: DashSet<K>,
     parser: P,
-    page_index_map: DashMap<K, Arc<RwLock<BTreeMap<u64, u64>>>>,
-    line_count_map: DashMap<K, Arc<RwLock<u64>>>,
-    last_pos_map: DashMap<K, Arc<RwLock<u64>>>,
-    last_line_index_map: DashMap<K, Arc<RwLock<u64>>>,
 }
 
 impl<Q,K,R,RR,P> FileIndexContext<Q,K,R,RR,P>
@@ -63,14 +72,10 @@ where
     pub fn new(parser: P) -> Self {
         Self {
             _marker: PhantomData,
-            position_map_map: DashMap::new(),
+            index_map: DashMap::new(),
             obsolete_set: DashSet::new(),
             all_obsolete_set: DashSet::new(),
             parser,
-            page_index_map: DashMap::new(),
-            line_count_map: DashMap::new(),
-            last_pos_map: DashMap::new(),
-            last_line_index_map: DashMap::new(),
         }
     }
 
@@ -78,61 +83,43 @@ where
         self.obsolete_set.insert(key.clone());
     }
 
-    pub async fn mark_all_obsolete(&self, key: &K) {
+    pub fn mark_all_obsolete(&self, key: &K) {
         self.all_obsolete_set.insert(key.clone());
         self.obsolete_set.insert(key.clone());
-        if let Some(entry) = self.last_pos_map.get(key) {
-            *entry.value().write().await = 0;
-        }
-        if let Some(entry) = self.last_line_index_map.get(key) {
-            *entry.value().write().await = 0;
-        }
     }
 
     fn get_lock(&self, key: &K) -> FileIndexLock {
-        let lock = self.position_map_map.entry(key.clone()).or_insert_with(|| {
-            // 新创建的 BTree：标记为需要全量加载
+        self.index_map.entry(key.clone()).or_insert_with(|| {
             self.all_obsolete_set.insert(key.clone());
             self.obsolete_set.insert(key.clone());
-            Arc::new(RwLock::new(BTreeMap::new()))
-        }).clone();
-        self.page_index_map.entry(key.clone()).or_insert_with(|| Arc::new(RwLock::new(BTreeMap::new())));
-        self.line_count_map.entry(key.clone()).or_insert_with(|| Arc::new(RwLock::new(0)));
-        self.last_pos_map.entry(key.clone()).or_insert_with(|| Arc::new(RwLock::new(0)));
-        self.last_line_index_map.entry(key.clone()).or_insert_with(|| Arc::new(RwLock::new(0)));
-        lock
+            Arc::new(RwLock::new(FileIndices {
+                time_index: BTreeMap::new(),
+                page_index: Vec::new(),
+                line_count: 0,
+                last_pos: 0,
+                last_line_index: 0,
+            }))
+        }).clone()
     }
 
-    async fn update_forward(
-        mut guard: RwLockWriteGuard<'_, BTreeMap<String, FilePosition>>,
-        mut page_guard: RwLockWriteGuard<'_, BTreeMap<u64, u64>>,
-        mut line_count_guard: RwLockWriteGuard<'_, u64>,
-        mut last_pos_guard: RwLockWriteGuard<'_, u64>,
-        mut last_line_index_guard: RwLockWriteGuard<'_, u64>,
-        file_path: impl AsRef<Path>,
-        incremental: bool,
-    ) -> Result<()> {
-        if !incremental {
-            guard.clear();
-            page_guard.clear();
-            *line_count_guard = 0;
-            *last_pos_guard = 0;
-            *last_line_index_guard = 0;
-        }
+    /// 增量更新：从 last_pos 继续正向读取新行
+    async fn update_index(&self, key: &K) -> Result<()> {
+        let lock = self.get_lock(key);
+        let mut indices = lock.write().await;
 
-        let start_pos = *last_pos_guard;
-        let mut line_index = *last_line_index_guard;
+        let start_pos = indices.last_pos;
+        let mut ln_index = indices.last_line_index;
 
+        let file_path = self.parser.get_path(key).await?;
         let mut reader = LineReader::new(file_path, Some(start_pos), None).await?;
         while let Some(line_with_pos) = reader.next_line().await? {
             let record = serde_json::from_str::<R>(line_with_pos.line.as_str())?;
-
-            match guard.entry(record.time().to_string()) {
+            match indices.time_index.entry(record.time().to_string()) {
                 Entry::Occupied(mut entry) => {
                     let min_start = entry.get().start_pos.min(line_with_pos.start_pos);
                     let max_end = entry.get().end_pos.max(line_with_pos.end_pos);
-                    let min_line = entry.get().start_line_index.min(line_index);
-                    let max_line = entry.get().end_line_index.max(line_index + 1);
+                    let min_line = entry.get().start_line_index.min(ln_index);
+                    let max_line = entry.get().end_line_index.max(ln_index + 1);
                     entry.get_mut().start_pos = min_start;
                     entry.get_mut().end_pos = max_end;
                     entry.get_mut().start_line_index = min_line;
@@ -142,62 +129,79 @@ where
                     entry.insert(FilePosition {
                         start_pos: line_with_pos.start_pos,
                         end_pos: line_with_pos.end_pos,
-                        start_line_index: line_index,
-                        end_line_index: line_index + 1,
+                        start_line_index: ln_index,
+                        end_line_index: ln_index + 1,
                     });
                 }
             }
-
-            if line_index % 1000 == 0 {
-                page_guard.insert(line_index / 1000, line_with_pos.start_pos);
+            if ln_index % 1000 == 0 {
+                let page = (ln_index / 1000) as usize;
+                if page >= indices.page_index.len() {
+                    indices.page_index.resize(page + 1, 0);
+                }
+                indices.page_index[page] = line_with_pos.start_pos;
             }
-
-            line_index += 1;
+            ln_index += 1;
         }
-
-        *line_count_guard = line_index;
-        *last_line_index_guard = line_index;
-        *last_pos_guard = reader.current_pos();
-
+        indices.line_count = ln_index;
+        indices.last_line_index = ln_index;
+        indices.last_pos = reader.current_pos();
         Ok(())
     }
 
-    async fn update_index(&self, key: &K) -> Result<()> {
-        let position_map = self.get_lock(key);
-        let page_map = self.page_index_map.get(key).unwrap().clone();
-        let line_count = self.line_count_map.get(key).unwrap().clone();
-        let last_pos = self.last_pos_map.get(key).unwrap().clone();
-        let last_line = self.last_line_index_map.get(key).unwrap().clone();
-
-        let guard = position_map.write().await;
-        let page_guard = page_map.write().await;
-        let line_count_guard = line_count.write().await;
-        let last_pos_guard = last_pos.write().await;
-        let last_line_guard = last_line.write().await;
-
-        let file_path = self.parser.get_path(key).await?;
-        Self::update_forward(guard, page_guard, line_count_guard, last_pos_guard, last_line_guard, file_path, true).await
-    }
-
+    /// 全量重建：从头扫描，清空所有索引
     async fn update_all_index(&self, key: &K) -> Result<()> {
-        let position_map = self.get_lock(key);
-        let page_map = self.page_index_map.get(key).unwrap().clone();
-        let line_count = self.line_count_map.get(key).unwrap().clone();
-        let last_pos = self.last_pos_map.get(key).unwrap().clone();
-        let last_line = self.last_line_index_map.get(key).unwrap().clone();
+        let lock = self.get_lock(key);
+        let mut indices = lock.write().await;
 
-        let guard = position_map.write().await;
-        let page_guard = page_map.write().await;
-        let line_count_guard = line_count.write().await;
-        let last_pos_guard = last_pos.write().await;
-        let last_line_guard = last_line.write().await;
+        indices.time_index.clear();
+        indices.page_index.clear();
+        indices.line_count = 0;
+        indices.last_pos = 0;
+        indices.last_line_index = 0;
 
         let file_path = self.parser.get_path(key).await?;
-        Self::update_forward(guard, page_guard, line_count_guard, last_pos_guard, last_line_guard, file_path, false).await
+        let mut reader = LineReader::new(file_path, None, None).await?;
+        let mut ln_index = 0u64;
+        while let Some(line_with_pos) = reader.next_line().await? {
+            let record = serde_json::from_str::<R>(line_with_pos.line.as_str())?;
+            match indices.time_index.entry(record.time().to_string()) {
+                Entry::Occupied(mut entry) => {
+                    let min_start = entry.get().start_pos.min(line_with_pos.start_pos);
+                    let max_end = entry.get().end_pos.max(line_with_pos.end_pos);
+                    let min_line = entry.get().start_line_index.min(ln_index);
+                    let max_line = entry.get().end_line_index.max(ln_index + 1);
+                    entry.get_mut().start_pos = min_start;
+                    entry.get_mut().end_pos = max_end;
+                    entry.get_mut().start_line_index = min_line;
+                    entry.get_mut().end_line_index = max_line;
+                }
+                Entry::Vacant(entry) => {
+                    entry.insert(FilePosition {
+                        start_pos: line_with_pos.start_pos,
+                        end_pos: line_with_pos.end_pos,
+                        start_line_index: ln_index,
+                        end_line_index: ln_index + 1,
+                    });
+                }
+            }
+            if ln_index % 1000 == 0 {
+                let page = (ln_index / 1000) as usize;
+                if page >= indices.page_index.len() {
+                    indices.page_index.resize(page + 1, 0);
+                }
+                indices.page_index[page] = line_with_pos.start_pos;
+            }
+            ln_index += 1;
+        }
+        indices.line_count = ln_index;
+        indices.last_line_index = ln_index;
+        indices.last_pos = reader.current_pos();
+        Ok(())
     }
 
     async fn query_reverse(&self, key: &K, start: &str, end: &str) -> Result<LinkedList<(u64, Arc<RR>)>> {
-        let position_map = self.get_lock(key);
+        let lock = self.get_lock(key);
 
         if self.obsolete_set.remove(key).is_some() {
             if self.all_obsolete_set.contains(key) {
@@ -215,20 +219,20 @@ where
         }
 
         let mut results = LinkedList::new();
-        let guard = position_map.read().await;
+        let indices = lock.read().await;
         let mut start_pos: Option<u64> = None;
         let mut end_pos: Option<u64> = None;
-        if let Some((_, position)) = guard.range(start.to_string()..=end.to_string()).next() {
+        if let Some((_, position)) = indices.time_index.range(start.to_string()..=end.to_string()).next() {
             start_pos = Some(position.start_pos);
         }
-        if let Some((_, position)) = guard.range(start.to_string()..=end.to_string()).next_back() {
+        if let Some((_, position)) = indices.time_index.range(start.to_string()..=end.to_string()).next_back() {
             end_pos = Some(position.end_pos);
         }
         if start_pos.is_some() && end_pos.is_some() {
             let file_path = self.parser.get_path(key).await?;
             let mut reader = ReverseLineReader::new(file_path, start_pos, end_pos).await?;
 
-            let line_index_lookup: BTreeMap<u64, u64> = guard.range(start.to_string()..=end.to_string())
+            let line_index_lookup: BTreeMap<u64, u64> = indices.time_index.range(start.to_string()..=end.to_string())
                 .map(|(_, pos)| (pos.start_pos, pos.start_line_index))
                 .collect();
 
@@ -265,7 +269,7 @@ where
     }
 
     pub async fn query_by_line_range(&self, key: &K, start_line: u64, end_line: u64) -> Result<Vec<(u64, Arc<RR>)>> {
-        let _position_map = self.get_lock(key);
+        self.get_lock(key); // 确保 key 被初始化
 
         if self.obsolete_set.remove(key).is_some() {
             if self.all_obsolete_set.contains(key) {
@@ -282,28 +286,22 @@ where
             }
         }
 
-        let line_count = {
-            let guard = self.line_count_map.get(key).unwrap();
-            *guard.read().await
-        };
-
+        let lock = self.get_lock(key);
+        let indices = lock.read().await;
+        let line_count = indices.line_count;
         let actual_start = start_line.min(line_count);
         let actual_end = end_line.min(line_count);
         if actual_start >= actual_end {
             return Ok(Vec::new());
         }
-
-        let page = actual_start / 1000;
-        let start_byte = {
-            let page_guard = self.page_index_map.get(key).unwrap();
-            let pages = page_guard.read().await;
-            pages.get(&page).copied().unwrap_or(0)
-        };
+        let page = (actual_start / 1000) as usize;
+        let start_byte = indices.page_index.get(page).copied().unwrap_or(0);
+        drop(indices);
 
         let file_path = self.parser.get_path(key).await?;
         let mut reader = LineReader::new(file_path, Some(start_byte), None).await?;
         let mut results = Vec::new();
-        let mut line_idx = page * 1000;
+        let mut line_idx = page as u64 * 1000;
 
         while let Some(line_with_pos) = reader.next_line().await? {
             if line_idx >= actual_end {
@@ -321,7 +319,7 @@ where
     }
 
     pub async fn query_last_n(&self, key: &K, n: u64) -> Result<Vec<(u64, Arc<RR>)>> {
-        let _position_map = self.get_lock(key);
+        self.get_lock(key); // 确保 key 被初始化
 
         if self.obsolete_set.remove(key).is_some() {
             if self.all_obsolete_set.contains(key) {
@@ -338,10 +336,8 @@ where
             }
         }
 
-        let line_count = {
-            let guard = self.line_count_map.get(key).unwrap();
-            *guard.read().await
-        };
+        let lock = self.get_lock(key);
+        let line_count = lock.read().await.line_count;
 
         if n == 0 || line_count == 0 {
             return Ok(Vec::new());
@@ -378,10 +374,6 @@ mod tests {
     use tokio::fs::*;
 
     // ========== FileIndexContext: mark + query ==========
-
-    use std::sync::OnceLock;
-
-    static TEST_DIR: OnceLock<tempfile::TempDir> = OnceLock::new();
 
     async fn get_path(dir: impl AsRef<Path>, key: &str) ->  Result<PathBuf> {
         let dir_ref = dir.as_ref();
@@ -433,14 +425,7 @@ mod tests {
         }
     }
 
-    /// Initializes the global Config singleton for tests using a temp directory.
-    /// Safe to call multiple times — only the first call initializes.
-    fn init_test_dir() -> PathBuf {
-        TEST_DIR.get_or_init(|| tempfile::tempdir().unwrap()).path().to_path_buf()
-    }
-
-    async fn append_jsonl(date: &str, line: &str) {
-        let dir = init_test_dir();
+    async fn append_jsonl(dir: impl AsRef<Path>, date: &str, line: &str) {
         let path = get_path(dir, date).await.unwrap();
         let mut f = tokio::fs::OpenOptions::new()
             .append(true)
@@ -456,44 +441,298 @@ mod tests {
 
     #[tokio::test]
     async fn test_mark_and_query_channel() {
-        let dir = init_test_dir();
+        let dir = tempfile::tempdir().unwrap();
         let date = "2026-06-24";
-        let file_path = get_path(&dir, date).await.unwrap();
+        let file_path = get_path(dir.path(), date).await.unwrap();
         if file_path.exists() {
             remove_file(&file_path).await.unwrap();
         }
 
         // timeline: 00:00:00 < A(08:00) < start(09:00) < B(10:00) < C(11:00) < end(13:00) < F(14:00)
-        append_jsonl(date, r#"{"content":"A","time":"2026-06-24 08:00:00"}"#).await;
-        append_jsonl(date, r#"{"content":"B","time":"2026-06-24 10:00:00"}"#).await;
+        append_jsonl(dir.path(), date, r#"{"content":"A","time":"2026-06-24 08:00:00"}"#).await;
+        append_jsonl(dir.path(), date, r#"{"content":"B","time":"2026-06-24 10:00:00"}"#).await;
 
-        let parser = TestRecordParser { root_dir: dir };
+        let parser = TestRecordParser { root_dir: dir.path().to_path_buf() };
         let indexer = FileIndexContext::new(parser);
-        // query range excludes A, includes B
+        // query range excludes A (line 0), includes B (line 1)
         let results = indexer.query_all((format!("{} 09:00:00", date), format!("{} 13:00:00", date))).await.unwrap();
         assert_eq!(results.len(), 1);
-        assert_eq!(results[0].content.as_str(), "B");
+        assert_eq!(results[0].0, 1);
+        assert_eq!(results[0].1.content.as_str(), "B");
 
         // write C (in range) after MemoryIndexer created
-        append_jsonl(date, r#"{"content":"C","time":"2026-06-24 11:00:00"}"#).await;
+        append_jsonl(dir.path(), date, r#"{"content":"C","time":"2026-06-24 11:00:00"}"#).await;
 
-        // mark + query — incremental load picks up C
+        // mark + query — incremental load picks up C (line 2)
         indexer.mark_obsolete(&date.to_string());
         let results = indexer.query_all((format!("{} 09:00:00", date), format!("{} 13:00:00", date))).await.unwrap();
         assert_eq!(results.len(), 2);
-        assert_eq!(results[0].content.as_str(), "B");
-        assert_eq!(results[1].content.as_str(), "C");
+        assert_eq!(results[0].0, 1);
+        assert_eq!(results[0].1.content.as_str(), "B");
+        assert_eq!(results[1].0, 2);
+        assert_eq!(results[1].1.content.as_str(), "C");
 
         // delete file, write D(before start), E(in range), F(after end)
         remove_file(&file_path).await.unwrap();
-        append_jsonl(date, r#"{"content":"D","time":"2026-06-24 08:30:00"}"#).await;
-        append_jsonl(date, r#"{"content":"E","time":"2026-06-24 10:30:00"}"#).await;
-        append_jsonl(date, r#"{"content":"F","time":"2026-06-24 14:00:00"}"#).await;
+        append_jsonl(dir.path(), date, r#"{"content":"D","time":"2026-06-24 08:30:00"}"#).await;
+        append_jsonl(dir.path(), date, r#"{"content":"E","time":"2026-06-24 10:30:00"}"#).await;
+        append_jsonl(dir.path(), date, r#"{"content":"F","time":"2026-06-24 14:00:00"}"#).await;
 
-        // mark_all — full rebuild, only E in range
-        indexer.mark_all_obsolete(&date.to_string()).await;
+        // mark_all — full rebuild, only E in range (line 1)
+        indexer.mark_all_obsolete(&date.to_string());
         let results = indexer.query_all((format!("{} 09:00:00", date), format!("{} 13:00:00", date))).await.unwrap();
         assert_eq!(results.len(), 1);
-        assert_eq!(results[0].content.as_str(), "E");
+        assert_eq!(results[0].0, 1);
+        assert_eq!(results[0].1.content.as_str(), "E");
+    }
+
+    #[tokio::test]
+    async fn test_query_by_line_range() {
+        let dir = tempfile::tempdir().unwrap();
+        let date = "2026-07-19";
+        let file_path = get_path(dir.path(), date).await.unwrap();
+        if file_path.exists() {
+            remove_file(&file_path).await.unwrap();
+        }
+
+        for i in 0..10 {
+            let h = 8 + i;
+            append_jsonl(dir.path(), date, &format!(r#"{{"content":"L{}","time":"2026-07-19 {:02}:00:00"}}"#, i, h)).await;
+        }
+
+        let parser = TestRecordParser { root_dir: dir.path().to_path_buf() };
+        let indexer = FileIndexContext::new(parser);
+
+        let results = indexer.query_by_line_range(&date.to_string(), 2, 5).await.unwrap();
+        assert_eq!(results.len(), 3);
+        assert_eq!(results[0].0, 2);
+        assert_eq!(results[0].1.content.as_str(), "L2");
+        assert_eq!(results[1].0, 3);
+        assert_eq!(results[1].1.content.as_str(), "L3");
+        assert_eq!(results[2].0, 4);
+        assert_eq!(results[2].1.content.as_str(), "L4");
+    }
+
+    #[tokio::test]
+    async fn test_query_by_line_range_empty() {
+        let dir = tempfile::tempdir().unwrap();
+        let date = "2026-07-19";
+        let file_path = get_path(dir.path(), date).await.unwrap();
+        if file_path.exists() {
+            remove_file(&file_path).await.unwrap();
+        }
+
+        for i in 0..5 {
+            append_jsonl(dir.path(), date, &format!(r#"{{"content":"L{}","time":"2026-07-19 {:02}:00:00"}}"#, i, 8+i)).await;
+        }
+
+        let parser = TestRecordParser { root_dir: dir.path().to_path_buf() };
+        let indexer = FileIndexContext::new(parser);
+
+        // 空区间
+        let results = indexer.query_by_line_range(&date.to_string(), 3, 3).await.unwrap();
+        assert_eq!(results.len(), 0);
+
+        // start > end
+        let results = indexer.query_by_line_range(&date.to_string(), 5, 3).await.unwrap();
+        assert_eq!(results.len(), 0);
+    }
+
+    #[tokio::test]
+    async fn test_query_by_line_range_oob() {
+        let dir = tempfile::tempdir().unwrap();
+        let date = "2026-07-19";
+        let file_path = get_path(dir.path(), date).await.unwrap();
+        if file_path.exists() {
+            remove_file(&file_path).await.unwrap();
+        }
+
+        for i in 0..10 {
+            let h = 8 + i;
+            append_jsonl(dir.path(), date, &format!(r#"{{"content":"L{}","time":"2026-07-19 {:02}:00:00"}}"#, i, h)).await;
+        }
+
+        let parser = TestRecordParser { root_dir: dir.path().to_path_buf() };
+        let indexer = FileIndexContext::new(parser);
+
+        // end 超出范围 → 截断到实际行数
+        let results = indexer.query_by_line_range(&date.to_string(), 5, 20).await.unwrap();
+        assert_eq!(results.len(), 5);
+        assert_eq!(results[0].0, 5);
+        assert_eq!(results[4].0, 9);
+
+        // 全部超出
+        let results = indexer.query_by_line_range(&date.to_string(), 10, 20).await.unwrap();
+        assert_eq!(results.len(), 0);
+    }
+
+    #[tokio::test]
+    async fn test_query_last_n() {
+        let dir = tempfile::tempdir().unwrap();
+        let date = "2026-07-19";
+        let file_path = get_path(dir.path(), date).await.unwrap();
+        if file_path.exists() {
+            remove_file(&file_path).await.unwrap();
+        }
+
+        for i in 0..10 {
+            let h = 8 + i;
+            append_jsonl(dir.path(), date, &format!(r#"{{"content":"L{}","time":"2026-07-19 {:02}:00:00"}}"#, i, h)).await;
+        }
+
+        let parser = TestRecordParser { root_dir: dir.path().to_path_buf() };
+        let indexer = FileIndexContext::new(parser);
+
+        let results = indexer.query_last_n(&date.to_string(), 3).await.unwrap();
+        assert_eq!(results.len(), 3);
+        assert_eq!(results[0].0, 7);
+        assert_eq!(results[0].1.content.as_str(), "L7");
+        assert_eq!(results[1].0, 8);
+        assert_eq!(results[1].1.content.as_str(), "L8");
+        assert_eq!(results[2].0, 9);
+        assert_eq!(results[2].1.content.as_str(), "L9");
+    }
+
+    #[tokio::test]
+    async fn test_query_last_n_overflow() {
+        let dir = tempfile::tempdir().unwrap();
+        let date = "2026-07-19";
+        let file_path = get_path(dir.path(), date).await.unwrap();
+        if file_path.exists() {
+            remove_file(&file_path).await.unwrap();
+        }
+
+        for i in 0..5 {
+            let h = 8 + i;
+            append_jsonl(dir.path(), date, &format!(r#"{{"content":"L{}","time":"2026-07-19 {:02}:00:00"}}"#, i, h)).await;
+        }
+
+        let parser = TestRecordParser { root_dir: dir.path().to_path_buf() };
+        let indexer = FileIndexContext::new(parser);
+
+        // n > 总行数 → 返回全部
+        let results = indexer.query_last_n(&date.to_string(), 100).await.unwrap();
+        assert_eq!(results.len(), 5);
+        assert_eq!(results[0].0, 0);
+        assert_eq!(results[4].0, 4);
+
+        // n = 0
+        let results = indexer.query_last_n(&date.to_string(), 0).await.unwrap();
+        assert_eq!(results.len(), 0);
+    }
+
+    #[tokio::test]
+    async fn test_incremental_update_line_index() {
+        let dir = tempfile::tempdir().unwrap();
+        let date = "2026-07-19";
+        let file_path = get_path(dir.path(), date).await.unwrap();
+        if file_path.exists() {
+            remove_file(&file_path).await.unwrap();
+        }
+
+        // 写入1005行
+        for i in 0..1005 {
+            let h = i / 60;
+            let m = i % 60;
+            append_jsonl(dir.path(), date, &format!(r#"{{"content":"L{}","time":"2026-07-19 {:02}:{:02}:00"}}"#, i, h, m)).await;
+        }
+
+        let parser = TestRecordParser { root_dir: dir.path().to_path_buf() };
+        let indexer = FileIndexContext::new(parser);
+
+        // 触发全量更新
+        let results = indexer.query_by_line_range(&date.to_string(), 0, 1005).await.unwrap();
+        assert_eq!(results.len(), 1005);
+
+        // 验证 page 索引: page 0 (line 0), page 1 (line 1000)
+        {
+            let lock = indexer.index_map.get(&date.to_string()).unwrap();
+            let indices = lock.read().await;
+            assert_eq!(indices.page_index.len(), 2);
+            assert_eq!(indices.line_count, 1005);
+        }
+
+        // 追加10行（总1015）
+        for i in 1005..1015 {
+            let h = i / 60;
+            let m = i % 60;
+            append_jsonl(dir.path(), date, &format!(r#"{{"content":"L{}","time":"2026-07-19 {:02}:{:02}:00"}}"#, i, h, m)).await;
+        }
+
+        // 增量更新
+        indexer.mark_obsolete(&date.to_string());
+        let results = indexer.query_last_n(&date.to_string(), 10).await.unwrap();
+        assert_eq!(results.len(), 10);
+        assert_eq!(results[0].0, 1005);
+        assert_eq!(results[9].0, 1014);
+
+        // page 索引不变（未跨越新page边界，1014 < 2000）
+        {
+            let lock = indexer.index_map.get(&date.to_string()).unwrap();
+            let indices = lock.read().await;
+            assert_eq!(indices.page_index.len(), 2);
+        }
+
+        // 继续追加到跨越2000边界（共2005行）
+        for i in 1015..2005 {
+            let h = i / 60;
+            let m = i % 60;
+            append_jsonl(dir.path(), date, &format!(r#"{{"content":"L{}","time":"2026-07-19 {:02}:{:02}:00"}}"#, i, h, m)).await;
+        }
+
+        indexer.mark_obsolete(&date.to_string());
+        let results = indexer.query_by_line_range(&date.to_string(), 2000, 2005).await.unwrap();
+        assert_eq!(results.len(), 5);
+        assert_eq!(results[0].0, 2000);
+
+        // page 索引新增 page 2
+        {
+            let lock = indexer.index_map.get(&date.to_string()).unwrap();
+            let indices = lock.read().await;
+            assert_eq!(indices.page_index.len(), 3);
+        }
+    }
+
+    #[tokio::test]
+    async fn test_page_index() {
+        let dir = tempfile::tempdir().unwrap();
+        let date = "2026-07-19";
+        let file_path = get_path(dir.path(), date).await.unwrap();
+        if file_path.exists() {
+            remove_file(&file_path).await.unwrap();
+        }
+
+        // 3005行
+        for i in 0..3005 {
+            let h = i / 60;
+            let m = i % 60;
+            append_jsonl(dir.path(), date, &format!(r#"{{"content":"L{}","time":"2026-07-19 {:02}:{:02}:00"}}"#, i, h, m)).await;
+        }
+
+        let parser = TestRecordParser { root_dir: dir.path().to_path_buf() };
+        let indexer = FileIndexContext::new(parser);
+
+        // 触发全量更新
+        let results = indexer.query_by_line_range(&date.to_string(), 0, 3005).await.unwrap();
+        assert_eq!(results.len(), 3005);
+
+        // page 索引4个: 0,1,2,3
+        {
+            let lock = indexer.index_map.get(&date.to_string()).unwrap();
+            let indices = lock.read().await;
+            assert_eq!(indices.page_index.len(), 4);
+        }
+
+        // 跨页范围查询
+        let results = indexer.query_by_line_range(&date.to_string(), 1500, 2500).await.unwrap();
+        assert_eq!(results.len(), 1000);
+        assert_eq!(results[0].0, 1500);
+        assert_eq!(results[999].0, 2499);
+
+        // 最后几行
+        let results = indexer.query_last_n(&date.to_string(), 5).await.unwrap();
+        assert_eq!(results.len(), 5);
+        assert_eq!(results[0].0, 3000);
+        assert_eq!(results[4].0, 3004);
     }
 }
