@@ -11,6 +11,7 @@ use tokio::sync::{RwLock, RwLockWriteGuard};
 use std::collections::{BTreeMap, LinkedList};
 
 use crate::error::Result;
+use crate::LineReader;
 use crate::ReverseLineReader;
 
 pub trait Record: Serialize + DeserializeOwned {
@@ -34,6 +35,8 @@ pub trait RecordCombiner<K,R,RR> {
 struct FilePosition {
     pub start_pos: u64,
     pub end_pos: u64,
+    pub start_line_index: u64,
+    pub end_line_index: u64,
 }
 
 type FileIndexLock = Arc<RwLock<BTreeMap<String, FilePosition>>>;
@@ -44,6 +47,10 @@ pub struct FileIndexContext<Q,K,R,RR,P> {
     obsolete_set: DashSet<K>,
     all_obsolete_set: DashSet<K>,
     parser: P,
+    page_index_map: DashMap<K, Arc<RwLock<BTreeMap<u64, u64>>>>,
+    line_count_map: DashMap<K, Arc<RwLock<u64>>>,
+    last_pos_map: DashMap<K, Arc<RwLock<u64>>>,
+    last_line_index_map: DashMap<K, Arc<RwLock<u64>>>,
 }
 
 impl<Q,K,R,RR,P> FileIndexContext<Q,K,R,RR,P>
@@ -60,6 +67,10 @@ where
             obsolete_set: DashSet::new(),
             all_obsolete_set: DashSet::new(),
             parser,
+            page_index_map: DashMap::new(),
+            line_count_map: DashMap::new(),
+            last_pos_map: DashMap::new(),
+            last_line_index_map: DashMap::new(),
         }
     }
 
@@ -67,60 +78,120 @@ where
         self.obsolete_set.insert(key.clone());
     }
 
-    pub fn mark_all_obsolete(&self, key: &K) {
+    pub async fn mark_all_obsolete(&self, key: &K) {
         self.all_obsolete_set.insert(key.clone());
         self.obsolete_set.insert(key.clone());
+        if let Some(entry) = self.last_pos_map.get(key) {
+            *entry.value().write().await = 0;
+        }
+        if let Some(entry) = self.last_line_index_map.get(key) {
+            *entry.value().write().await = 0;
+        }
     }
 
     fn get_lock(&self, key: &K) -> FileIndexLock {
         let lock = self.position_map_map.entry(key.clone()).or_insert_with(|| {
-            // 新创建的 BTree：标记为需要全量加载
             self.all_obsolete_set.insert(key.clone());
             self.obsolete_set.insert(key.clone());
             Arc::new(RwLock::new(BTreeMap::new()))
         }).clone();
+        self.page_index_map.entry(key.clone()).or_insert_with(|| Arc::new(RwLock::new(BTreeMap::new())));
+        self.line_count_map.entry(key.clone()).or_insert_with(|| Arc::new(RwLock::new(0)));
+        self.last_pos_map.entry(key.clone()).or_insert_with(|| Arc::new(RwLock::new(0)));
+        self.last_line_index_map.entry(key.clone()).or_insert_with(|| Arc::new(RwLock::new(0)));
         lock
     }
 
-    async fn update(mut guard: RwLockWriteGuard<'_, BTreeMap<String, FilePosition>>, file_path: impl AsRef<Path>) -> Result<()> {
-        let last_key = if let Some((key, _)) = guard.last_key_value() {
-            key.clone()
-        } else {
-            String::from("2000-01-01 00:00:00")
-        };
-        let mut reader = ReverseLineReader::new(file_path, None, None).await?;
+    async fn update_forward(
+        mut guard: RwLockWriteGuard<'_, BTreeMap<String, FilePosition>>,
+        mut page_guard: RwLockWriteGuard<'_, BTreeMap<u64, u64>>,
+        mut line_count_guard: RwLockWriteGuard<'_, u64>,
+        mut last_pos_guard: RwLockWriteGuard<'_, u64>,
+        mut last_line_index_guard: RwLockWriteGuard<'_, u64>,
+        file_path: impl AsRef<Path>,
+        incremental: bool,
+    ) -> Result<()> {
+        if !incremental {
+            guard.clear();
+            page_guard.clear();
+            *line_count_guard = 0;
+            *last_pos_guard = 0;
+            *last_line_index_guard = 0;
+        }
+
+        let start_pos = *last_pos_guard;
+        let mut line_index = *last_line_index_guard;
+
+        let mut reader = LineReader::new(file_path, Some(start_pos), None).await?;
         while let Some(line_with_pos) = reader.next_line().await? {
             let record = serde_json::from_str::<R>(line_with_pos.line.as_str())?;
-            if record.time() < last_key.as_str() {
-                break;
-            }
+
             match guard.entry(record.time().to_string()) {
                 Entry::Occupied(mut entry) => {
-                    let min_start_pos = entry.get().start_pos.min(line_with_pos.start_pos);
-                    let max_end_pos = entry.get().end_pos.max(line_with_pos.end_pos);
-                    entry.get_mut().start_pos = min_start_pos;
-                    entry.get_mut().end_pos = max_end_pos;
+                    let min_start = entry.get().start_pos.min(line_with_pos.start_pos);
+                    let max_end = entry.get().end_pos.max(line_with_pos.end_pos);
+                    let min_line = entry.get().start_line_index.min(line_index);
+                    let max_line = entry.get().end_line_index.max(line_index + 1);
+                    entry.get_mut().start_pos = min_start;
+                    entry.get_mut().end_pos = max_end;
+                    entry.get_mut().start_line_index = min_line;
+                    entry.get_mut().end_line_index = max_line;
                 }
                 Entry::Vacant(entry) => {
                     entry.insert(FilePosition {
                         start_pos: line_with_pos.start_pos,
                         end_pos: line_with_pos.end_pos,
+                        start_line_index: line_index,
+                        end_line_index: line_index + 1,
                     });
                 }
             }
+
+            if line_index % 1000 == 0 {
+                page_guard.insert(line_index / 1000, line_with_pos.start_pos);
+            }
+
+            line_index += 1;
         }
+
+        *line_count_guard = line_index;
+        *last_pos_guard = reader.current_pos();
+
         Ok(())
     }
 
-    async fn update_index(&self, guard: RwLockWriteGuard<'_, BTreeMap<String, FilePosition>>, key: &K) -> Result<()> {
+    async fn update_index(&self, key: &K) -> Result<()> {
+        let position_map = self.get_lock(key);
+        let page_map = self.page_index_map.get(key).unwrap().clone();
+        let line_count = self.line_count_map.get(key).unwrap().clone();
+        let last_pos = self.last_pos_map.get(key).unwrap().clone();
+        let last_line = self.last_line_index_map.get(key).unwrap().clone();
+
+        let guard = position_map.write().await;
+        let page_guard = page_map.write().await;
+        let line_count_guard = line_count.write().await;
+        let last_pos_guard = last_pos.write().await;
+        let last_line_guard = last_line.write().await;
+
         let file_path = self.parser.get_path(key).await?;
-        Self::update(guard, file_path).await
+        Self::update_forward(guard, page_guard, line_count_guard, last_pos_guard, last_line_guard, file_path, true).await
     }
 
-    async fn update_all_index(&self, mut guard: RwLockWriteGuard<'_, BTreeMap<String, FilePosition>>, key: &K) -> Result<()> {
-        guard.clear();
+    async fn update_all_index(&self, key: &K) -> Result<()> {
+        let position_map = self.get_lock(key);
+        let page_map = self.page_index_map.get(key).unwrap().clone();
+        let line_count = self.line_count_map.get(key).unwrap().clone();
+        let last_pos = self.last_pos_map.get(key).unwrap().clone();
+        let last_line = self.last_line_index_map.get(key).unwrap().clone();
+
+        let guard = position_map.write().await;
+        let page_guard = page_map.write().await;
+        let line_count_guard = line_count.write().await;
+        let last_pos_guard = last_pos.write().await;
+        let last_line_guard = last_line.write().await;
+
         let file_path = self.parser.get_path(key).await?;
-        Self::update(guard, file_path).await
+        Self::update_forward(guard, page_guard, line_count_guard, last_pos_guard, last_line_guard, file_path, false).await
     }
 
     async fn query_reverse(&self, key: &K, start: &str, end: &str) -> Result<LinkedList<RR>> {
@@ -128,15 +199,13 @@ where
 
         if self.obsolete_set.remove(key).is_some() {
             if self.all_obsolete_set.contains(key) {
-                let guard = position_map.write().await;
-                if let Err(e) = self.update_all_index(guard, key).await {
+                if let Err(e) = self.update_all_index(key).await {
                     self.all_obsolete_set.insert(key.clone());
                     self.obsolete_set.insert(key.clone());
                     return Err(e);
                 }
             } else {
-                let guard = position_map.write().await;
-                if let Err(e) = self.update_index(guard, key).await {
+                if let Err(e) = self.update_index(key).await {
                     self.obsolete_set.insert(key.clone());
                     return Err(e);
                 }
@@ -309,7 +378,7 @@ mod tests {
         append_jsonl(date, r#"{"content":"F","time":"2026-06-24 14:00:00"}"#).await;
 
         // mark_all — full rebuild, only E in range
-        indexer.mark_all_obsolete(&date.to_string());
+        indexer.mark_all_obsolete(&date.to_string()).await;
         let results = indexer.query_all((format!("{} 09:00:00", date), format!("{} 13:00:00", date))).await.unwrap();
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].content.as_str(), "E");
