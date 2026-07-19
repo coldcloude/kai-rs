@@ -196,7 +196,7 @@ where
         Self::update_forward(guard, page_guard, line_count_guard, last_pos_guard, last_line_guard, file_path, false).await
     }
 
-    async fn query_reverse(&self, key: &K, start: &str, end: &str) -> Result<LinkedList<RR>> {
+    async fn query_reverse(&self, key: &K, start: &str, end: &str) -> Result<LinkedList<(u64, Arc<RR>)>> {
         let position_map = self.get_lock(key);
 
         if self.obsolete_set.remove(key).is_some() {
@@ -227,16 +227,22 @@ where
         if start_pos.is_some() && end_pos.is_some() {
             let file_path = self.parser.get_path(key).await?;
             let mut reader = ReverseLineReader::new(file_path, start_pos, end_pos).await?;
+
+            let line_index_lookup: BTreeMap<u64, u64> = guard.range(start.to_string()..=end.to_string())
+                .map(|(_, pos)| (pos.start_pos, pos.start_line_index))
+                .collect();
+
             while let Some(line_with_pos) = reader.next_line().await? {
                 let record = serde_json::from_str::<R>(line_with_pos.line.as_str())?;
                 let record = self.parser.combine_record(key, &record);
-                results.push_front(record);
+                let line_index = line_index_lookup.get(&line_with_pos.start_pos).copied().unwrap_or(0);
+                results.push_front((line_index, Arc::new(record)));
             }
         }
         Ok(results)
     }
 
-    pub async fn query_all(&self, query: Q) -> Result<Vec<RR>> {
+    pub async fn query_all(&self, query: Q) -> Result<Vec<(u64, Arc<RR>)>> {
         let key_with_range = self.parser.parse_query(query);
         let mut results_list = LinkedList::new();
         for (key, (start, end)) in key_with_range {
@@ -256,6 +262,111 @@ where
             }
         }
         Ok(results)
+    }
+
+    pub async fn query_by_line_range(&self, key: &K, start_line: u64, end_line: u64) -> Result<Vec<(u64, Arc<RR>)>> {
+        let _position_map = self.get_lock(key);
+
+        if self.obsolete_set.remove(key).is_some() {
+            if self.all_obsolete_set.contains(key) {
+                if let Err(e) = self.update_all_index(key).await {
+                    self.all_obsolete_set.insert(key.clone());
+                    self.obsolete_set.insert(key.clone());
+                    return Err(e);
+                }
+            } else {
+                if let Err(e) = self.update_index(key).await {
+                    self.obsolete_set.insert(key.clone());
+                    return Err(e);
+                }
+            }
+        }
+
+        let line_count = {
+            let guard = self.line_count_map.get(key).unwrap();
+            *guard.read().await
+        };
+
+        let actual_start = start_line.min(line_count);
+        let actual_end = end_line.min(line_count);
+        if actual_start >= actual_end {
+            return Ok(Vec::new());
+        }
+
+        let page = actual_start / 1000;
+        let start_byte = {
+            let page_guard = self.page_index_map.get(key).unwrap();
+            let pages = page_guard.read().await;
+            pages.get(&page).copied().unwrap_or(0)
+        };
+
+        let file_path = self.parser.get_path(key).await?;
+        let mut reader = LineReader::new(file_path, Some(start_byte), None).await?;
+        let mut results = Vec::new();
+        let mut line_idx = page * 1000;
+
+        while let Some(line_with_pos) = reader.next_line().await? {
+            if line_idx >= actual_end {
+                break;
+            }
+            if line_idx >= actual_start {
+                let record = serde_json::from_str::<R>(line_with_pos.line.as_str())?;
+                let record = self.parser.combine_record(key, &record);
+                results.push((line_idx, Arc::new(record)));
+            }
+            line_idx += 1;
+        }
+
+        Ok(results)
+    }
+
+    pub async fn query_last_n(&self, key: &K, n: u64) -> Result<Vec<(u64, Arc<RR>)>> {
+        let _position_map = self.get_lock(key);
+
+        if self.obsolete_set.remove(key).is_some() {
+            if self.all_obsolete_set.contains(key) {
+                if let Err(e) = self.update_all_index(key).await {
+                    self.all_obsolete_set.insert(key.clone());
+                    self.obsolete_set.insert(key.clone());
+                    return Err(e);
+                }
+            } else {
+                if let Err(e) = self.update_index(key).await {
+                    self.obsolete_set.insert(key.clone());
+                    return Err(e);
+                }
+            }
+        }
+
+        let line_count = {
+            let guard = self.line_count_map.get(key).unwrap();
+            *guard.read().await
+        };
+
+        if n == 0 || line_count == 0 {
+            return Ok(Vec::new());
+        }
+
+        if n >= line_count {
+            return self.query_by_line_range(key, 0, line_count).await;
+        }
+
+        let file_path = self.parser.get_path(key).await?;
+        let mut reader = ReverseLineReader::new(file_path, None, None).await?;
+        let mut results = LinkedList::new();
+
+        for _ in 0..n {
+            if let Some(line_with_pos) = reader.next_line().await? {
+                let record = serde_json::from_str::<R>(line_with_pos.line.as_str())?;
+                let record = self.parser.combine_record(key, &record);
+                let line_index = line_count - results.len() as u64 - 1;
+                results.push_front((line_index, Arc::new(record)));
+            } else {
+                break;
+            }
+        }
+
+        Ok(results.into_iter().collect())
     }
 }
 
