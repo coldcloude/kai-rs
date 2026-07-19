@@ -48,22 +48,29 @@ skip to actual_start, collect up to n lines
 
 ### query_before 实现
 
-`query_before` 退化为 `query_after`：计算包含 `line` 的前 n 行的区间，然后正向读取。
+使用 `ReverseLineReader` 从 `line` 行所在 page 的末尾反向读取：
 
 ```
-actual_line = line.min(end_line_index - 1)
-actual_first = actual_line.saturating_sub(n - 1)
-query_after(file_path, actual_first, actual_line - actual_first + 1)
+if n == 0: return empty
+if line >= end_line_index: return Err
+page = line / 1000
+end_byte = page_index[page+1] or end_pos   // page 的结尾（exclusive）
+ReverseLineReader(file_path, start_pos=page_index[page], end_pos=end_byte)
+扫描整个 page（反向），收集行号 ≤ line 的行，遇到行号 < line - n + 1 时停止
+若 n 行未收满且存在上一页，继续扫描上一页
+结果 push_front 保证正序
 ```
 
-这样 `query_before` 无需单独的反向读取逻辑，完全复用 `query_after` 的正向实现。page 索引保证不从头扫文件。
+`query_first(0, n)` 直接用 `LineReader` 正向读。
+`query_last(n)` = `query_before(end_line_index - 1, n)`。
 
 ### 边角处理
 
-- `line` 超出 `[0, end_line_index)` 范围 → 钳制到有效范围
-- `n` 超过可用行数 → 返回所有可用行，不报错
+- `query_after`：`line >= end_line_index` → 报错
+- `query_before`：`line >= end_line_index` → 报错
+- 数量不足：收集到的行数 `k < n` 时，返回 `k` 行，不报错
 - `n == 0` → 返回空
-- `end_line_index == 0` → 返回空
+- `end_line_index == 0` → 返回空（不触发错误）
 
 ### 删除
 
