@@ -29,10 +29,6 @@ pub trait QueryParser<Q,K> {
     fn parse_query(&self, query: Q) -> Vec<(K, (String, String))>;
 }
 
-pub trait RecordCombiner<K, R, RR> {
-    fn combine_record(&self, key: &K, record: &R) -> RR;
-}
-
 #[derive(Debug, Clone)]
 struct FilePosition {
     pub start_pos: u64,
@@ -228,20 +224,19 @@ impl FileIndices {
 
 type FileIndexLock = Arc<RwLock<FileIndices>>;
 
-pub struct FileIndexContext<Q,K,R,RR,P> {
-    _marker: PhantomData<(Q,R,RR)>,
+pub struct FileIndexContext<Q,K,R,P> {
+    _marker: PhantomData<(Q,R)>,
     index_map: DashMap<K, FileIndexLock>,
     obsolete_set: DashSet<K>,
     all_obsolete_set: DashSet<K>,
     pub parser: P,
 }
 
-impl<Q,K,R,RR,P> FileIndexContext<Q,K,R,RR,P>
+impl<Q,K,R,P> FileIndexContext<Q,K,R,P>
 where
     K: Eq + Hash + Clone + Send + Sync,
     R: Record,
-    RR: Send + Sync,
-    P: FilePathGenerator<K> + QueryParser<Q,K> + RecordCombiner<K, R, RR>,
+    P: FilePathGenerator<K> + QueryParser<Q,K>,
 {
     pub fn new(parser: P) -> Self {
         Self {
@@ -333,44 +328,36 @@ where
         Ok(results)
     }
 
-    pub async fn query_after(&self, key: &K, line: u32, n: u32) -> Result<Vec<(u32, Arc<RR>)>> {
-        self.get_lock(key);
+    pub async fn query_after(&self, key: &K, line: u32, n: u32) -> Result<Vec<(u32, R)>> {
         self.ensure_updated(key).await?;
         let file_path = self.parser.get_path(key).await?;
         let lock = self.get_lock(key);
         let indices = lock.read().await;
-        let raw = indices.query_after::<R>(file_path, line, n).await?;
-        Ok(raw.into_iter().map(|(idx, rec)| (idx, Arc::new(self.parser.combine_record(key, &rec)))).collect())
+        indices.query_after::<R>(file_path, line, n).await
     }
 
-    pub async fn query_before(&self, key: &K, line: u32, n: u32) -> Result<Vec<(u32, Arc<RR>)>> {
-        self.get_lock(key);
+    pub async fn query_before(&self, key: &K, line: u32, n: u32) -> Result<Vec<(u32, R)>> {
         self.ensure_updated(key).await?;
         let file_path = self.parser.get_path(key).await?;
         let lock = self.get_lock(key);
         let indices = lock.read().await;
-        let raw = indices.query_before::<R>(file_path, line, n).await?;
-        Ok(raw.into_iter().map(|(idx, rec)| (idx, Arc::new(self.parser.combine_record(key, &rec)))).collect())
+        indices.query_before::<R>(file_path, line, n).await
     }
 
-    pub async fn query_first(&self, key: &K, n: u32) -> Result<Vec<(u32, Arc<RR>)>> {
-        self.get_lock(key);
+    pub async fn query_first(&self, key: &K, n: u32) -> Result<Vec<(u32, R)>> {
         self.ensure_updated(key).await?;
         let file_path = self.parser.get_path(key).await?;
         let lock = self.get_lock(key);
         let indices = lock.read().await;
-        let raw = indices.query_first::<R>(file_path, n).await?;
-        Ok(raw.into_iter().map(|(idx, rec)| (idx, Arc::new(self.parser.combine_record(key, &rec)))).collect())
+        indices.query_first::<R>(file_path, n).await
     }
 
-    pub async fn query_last(&self, key: &K, n: u32) -> Result<Vec<(u32, Arc<RR>)>> {
-        self.get_lock(key);
+    pub async fn query_last(&self, key: &K, n: u32) -> Result<Vec<(u32, R)>> {
         self.ensure_updated(key).await?;
         let file_path = self.parser.get_path(key).await?;
         let lock = self.get_lock(key);
         let indices = lock.read().await;
-        let raw = indices.query_last::<R>(file_path, n).await?;
-        Ok(raw.into_iter().map(|(idx, rec)| (idx, Arc::new(self.parser.combine_record(key, &rec)))).collect())
+        indices.query_last::<R>(file_path, n).await
     }
 }
 
@@ -382,6 +369,8 @@ mod tests {
     use tokio::fs::*;
 
     // ========== FileIndexContext: mark + query ==========
+
+    type TestContext = FileIndexContext<(String, String), String, TestRecod, TestRecordParser>;
 
     async fn get_path(dir: impl AsRef<Path>, key: &str) ->  Result<PathBuf> {
         let dir_ref = dir.as_ref();
@@ -427,12 +416,6 @@ mod tests {
         }
     }
 
-    impl RecordCombiner<String, TestRecod, TestRecod> for TestRecordParser {
-        fn combine_record(&self, _: &String, record: &TestRecod) -> TestRecod {
-            record.clone()
-        }
-    }
-
     async fn append_jsonl(dir: impl AsRef<Path>, date: &str, line: &str) {
         let path = get_path(dir, date).await.unwrap();
         let mut f = tokio::fs::OpenOptions::new()
@@ -461,7 +444,7 @@ mod tests {
         append_jsonl(dir.path(), date, r#"{"content":"B","time":"2026-06-24 10:00:00"}"#).await;
 
         let parser = TestRecordParser { root_dir: dir.path().to_path_buf() };
-        let indexer = FileIndexContext::new(parser);
+        let indexer: TestContext = FileIndexContext::new(parser);
         // query range excludes A (line 0), includes B (line 1)
         let results = indexer.query_all((format!("{} 09:00:00", date), format!("{} 13:00:00", date))).await.unwrap();
         assert_eq!(results.len(), 1);
@@ -510,7 +493,7 @@ mod tests {
         }
 
         let parser = TestRecordParser { root_dir: dir.path().to_path_buf() };
-        let indexer = FileIndexContext::new(parser);
+        let indexer: TestContext = FileIndexContext::new(parser);
 
         let results = indexer.query_after(&date.to_string(), 2, 3).await.unwrap();
         assert_eq!(results.len(), 3);
@@ -536,7 +519,7 @@ mod tests {
         }
 
         let parser = TestRecordParser { root_dir: dir.path().to_path_buf() };
-        let indexer = FileIndexContext::new(parser);
+        let indexer: TestContext = FileIndexContext::new(parser);
 
         // n=0 返回空
         let results = indexer.query_after(&date.to_string(), 2, 0).await.unwrap();
@@ -558,7 +541,7 @@ mod tests {
         }
 
         let parser = TestRecordParser { root_dir: dir.path().to_path_buf() };
-        let indexer = FileIndexContext::new(parser);
+        let indexer: TestContext = FileIndexContext::new(parser);
 
         // n 超出可用范围 → 返回实际可用行数
         let results = indexer.query_after(&date.to_string(), 5, 20).await.unwrap();
@@ -582,7 +565,7 @@ mod tests {
         }
 
         let parser = TestRecordParser { root_dir: dir.path().to_path_buf() };
-        let indexer = FileIndexContext::new(parser);
+        let indexer: TestContext = FileIndexContext::new(parser);
 
         // line >= end_line_index → Err
         let results = indexer.query_after(&date.to_string(), 10, 5).await;
@@ -604,7 +587,7 @@ mod tests {
         }
 
         let parser = TestRecordParser { root_dir: dir.path().to_path_buf() };
-        let indexer = FileIndexContext::new(parser);
+        let indexer: TestContext = FileIndexContext::new(parser);
 
         let results = indexer.query_before(&date.to_string(), 9, 3).await.unwrap();
         assert_eq!(results.len(), 3);
@@ -631,7 +614,7 @@ mod tests {
         }
 
         let parser = TestRecordParser { root_dir: dir.path().to_path_buf() };
-        let indexer = FileIndexContext::new(parser);
+        let indexer: TestContext = FileIndexContext::new(parser);
 
         // n > 总行数 → 返回全部
         let results = indexer.query_before(&date.to_string(), 4, 100).await.unwrap();
@@ -659,7 +642,7 @@ mod tests {
         }
 
         let parser = TestRecordParser { root_dir: dir.path().to_path_buf() };
-        let indexer = FileIndexContext::new(parser);
+        let indexer: TestContext = FileIndexContext::new(parser);
 
         // line >= end_line_index → Err
         let results = indexer.query_before(&date.to_string(), 10, 5).await;
@@ -681,7 +664,7 @@ mod tests {
         }
 
         let parser = TestRecordParser { root_dir: dir.path().to_path_buf() };
-        let indexer = FileIndexContext::new(parser);
+        let indexer: TestContext = FileIndexContext::new(parser);
 
         let results = indexer.query_first(&date.to_string(), 3).await.unwrap();
         assert_eq!(results.len(), 3);
@@ -708,7 +691,7 @@ mod tests {
         }
 
         let parser = TestRecordParser { root_dir: dir.path().to_path_buf() };
-        let indexer = FileIndexContext::new(parser);
+        let indexer: TestContext = FileIndexContext::new(parser);
 
         let results = indexer.query_last(&date.to_string(), 3).await.unwrap();
         assert_eq!(results.len(), 3);
@@ -737,7 +720,7 @@ mod tests {
         }
 
         let parser = TestRecordParser { root_dir: dir.path().to_path_buf() };
-        let indexer = FileIndexContext::new(parser);
+        let indexer: TestContext = FileIndexContext::new(parser);
 
         // 触发全量更新
         let results = indexer.query_after(&date.to_string(), 0, 1005).await.unwrap();
@@ -809,7 +792,7 @@ mod tests {
         }
 
         let parser = TestRecordParser { root_dir: dir.path().to_path_buf() };
-        let indexer = FileIndexContext::new(parser);
+        let indexer: TestContext = FileIndexContext::new(parser);
 
         // 触发全量更新
         let results = indexer.query_after(&date.to_string(), 0, 3005).await.unwrap();
