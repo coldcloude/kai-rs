@@ -23,7 +23,7 @@ use tokio::sync::{mpsc, Notify};
 pub struct FileObjectAppender<K, R, W, E = NoopErrorHandler> {
     writer: Arc<W>,
     error_handler: Arc<E>,
-    map: DashMap<K, (mpsc::UnboundedSender<Vec<R>>, Arc<Notify>)>,
+    map: Arc<DashMap<K, (mpsc::UnboundedSender<Vec<R>>, Arc<Notify>)>>,
     timeout: Duration,
     batch_size: usize,
 }
@@ -39,7 +39,7 @@ where
         Self {
             writer: Arc::new(writer),
             error_handler: Arc::new(error_handler),
-            map: DashMap::new(),
+            map: Arc::new(DashMap::new()),
             timeout,
             batch_size,
         }
@@ -90,18 +90,49 @@ where
     W: FileAppendWriter<K, R>,
     E: ErrorHandler<K, R>,
 {
+    #[allow(clippy::too_many_arguments)]
     async fn flush_task(
         key: K,
         tx: mpsc::UnboundedSender<Vec<R>>,
-        rx: mpsc::UnboundedReceiver<Vec<R>>,
+        mut rx: mpsc::UnboundedReceiver<Vec<R>>,
         notify: Arc<Notify>,
-        map: DashMap<K, (mpsc::UnboundedSender<Vec<R>>, Arc<Notify>)>,
+        map: Arc<DashMap<K, (mpsc::UnboundedSender<Vec<R>>, Arc<Notify>)>>,
         writer: Arc<W>,
         error_handler: Arc<E>,
         timeout: Duration,
         batch_size: usize,
     ) {
-        let _ = (key, tx, rx, notify, map, writer, error_handler, timeout, batch_size);
+        let mut batch = Vec::with_capacity(batch_size);
+        let deadline = tokio::time::Instant::now() + timeout;
+
+        loop {
+            let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+            if remaining.is_zero() {
+                break;
+            }
+            tokio::select! {
+                Some(chunk) = rx.recv() => {
+                    batch.extend(chunk);
+                    if batch.len() >= batch_size {
+                        break;
+                    }
+                }
+                _ = tokio::time::sleep(remaining) => break,
+                _ = notify.notified() => break,
+            }
+        }
+
+        map.remove(&key);
+        drop(tx);
+
+        if !batch.is_empty() {
+            while let Ok(chunk) = rx.try_recv() {
+                batch.extend(chunk);
+            }
+            if let Err(e) = writer.write(&key, batch).await {
+                error_handler.on_write_error(&key, Vec::new(), &e);
+            }
+        }
     }
 }
 
@@ -161,5 +192,81 @@ mod tests {
         let entry_count = appender.map.len();
         appender.append("key1".to_string(), vec!["b".to_string()]).await;
         assert_eq!(appender.map.len(), entry_count);
+    }
+
+    #[tokio::test]
+    async fn test_flush_triggers_on_batch_size() {
+        let writes = Arc::new(Mutex::new(Vec::new()));
+        let writer = MockWriter { writes: writes.clone() };
+        let appender: FileObjectAppender<String, String, MockWriter> =
+            FileObjectAppender::new(writer, NoopErrorHandler, Duration::from_secs(60), 2);
+
+        appender.append("key1".to_string(), vec!["a".to_string()]).await;
+        appender.append("key1".to_string(), vec!["b".to_string()]).await;
+
+        tokio::time::sleep(Duration::from_millis(100)).await;
+
+        let writes = writes.lock().unwrap();
+        assert_eq!(writes.len(), 1);
+        assert_eq!(writes[0].0, "key1");
+        assert_eq!(writes[0].1.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn test_flush_triggers_on_timeout() {
+        let writes = Arc::new(Mutex::new(Vec::new()));
+        let writer = MockWriter { writes: writes.clone() };
+        let appender: FileObjectAppender<String, String, MockWriter> =
+            FileObjectAppender::new(writer, NoopErrorHandler, Duration::from_millis(50), 100);
+
+        appender.append("key1".to_string(), vec!["a".to_string()]).await;
+
+        tokio::time::sleep(Duration::from_millis(200)).await;
+
+        let writes = writes.lock().unwrap();
+        assert_eq!(writes.len(), 1);
+        assert_eq!(writes[0].1, vec!["a".to_string()]);
+    }
+
+    #[tokio::test]
+    async fn test_error_handler_called_on_write_failure() {
+        struct FailingWriter;
+        #[async_trait]
+        impl FileAppendWriter<String, String> for FailingWriter {
+            async fn write(&self, _key: &String, _records: Vec<String>) -> crate::error::Result<()> {
+                Err(crate::error::Error::ExternalError(
+                    std::io::Error::new(std::io::ErrorKind::Other, "write failed").into(),
+                ))
+            }
+        }
+
+        let errors = Arc::new(Mutex::new(Vec::new()));
+        let handler = MockErrorHandler { errors: errors.clone() };
+        let appender: FileObjectAppender<String, String, FailingWriter, MockErrorHandler> =
+            FileObjectAppender::new(FailingWriter, handler, Duration::from_millis(50), 100);
+
+        appender.append("key1".to_string(), vec!["a".to_string()]).await;
+
+        tokio::time::sleep(Duration::from_millis(200)).await;
+
+        let errors = errors.lock().unwrap();
+        assert_eq!(errors.len(), 1);
+        assert_eq!(errors[0].0, "key1");
+    }
+
+    #[tokio::test]
+    async fn test_new_channel_created_after_flush() {
+        let writes = Arc::new(Mutex::new(Vec::new()));
+        let writer = MockWriter { writes: writes.clone() };
+        let appender: FileObjectAppender<String, String, MockWriter> =
+            FileObjectAppender::new(writer, NoopErrorHandler, Duration::from_millis(50), 100);
+
+        appender.append("key1".to_string(), vec!["a".to_string()]).await;
+        tokio::time::sleep(Duration::from_millis(200)).await;
+
+        assert!(!appender.map.contains_key("key1"));
+
+        appender.append("key1".to_string(), vec!["b".to_string()]).await;
+        assert!(appender.map.contains_key("key1"));
     }
 }
