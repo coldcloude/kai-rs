@@ -81,6 +81,18 @@ where
             }
         }
     }
+
+    pub async fn flush_key(&self, key: &K) {
+        if let Some(entry) = self.map.get(key) {
+            entry.value().1.notify_one();
+        }
+    }
+
+    pub async fn flush_all(&self) {
+        for entry in self.map.iter() {
+            entry.value().1.notify_one();
+        }
+    }
 }
 
 impl<K, R, W, E> FileObjectAppender<K, R, W, E>
@@ -125,10 +137,10 @@ where
         map.remove(&key);
         drop(tx);
 
+        while let Ok(chunk) = rx.try_recv() {
+            batch.extend(chunk);
+        }
         if !batch.is_empty() {
-            while let Ok(chunk) = rx.try_recv() {
-                batch.extend(chunk);
-            }
             if let Err(e) = writer.write(&key, batch).await {
                 error_handler.on_write_error(&key, Vec::new(), &e);
             }
@@ -268,5 +280,50 @@ mod tests {
 
         appender.append("key1".to_string(), vec!["b".to_string()]).await;
         assert!(appender.map.contains_key("key1"));
+    }
+
+    #[tokio::test]
+    async fn test_flush_key_triggers_write() {
+        let writes = Arc::new(Mutex::new(Vec::new()));
+        let writer = MockWriter { writes: writes.clone() };
+        let appender: FileObjectAppender<String, String, MockWriter> =
+            FileObjectAppender::new(writer, NoopErrorHandler, Duration::from_secs(60), 100);
+
+        appender.append("key1".to_string(), vec!["a".to_string()]).await;
+        appender.flush_key(&"key1".to_string()).await;
+
+        tokio::time::sleep(Duration::from_millis(100)).await;
+
+        let writes = writes.lock().unwrap();
+        assert_eq!(writes.len(), 1);
+        assert_eq!(writes[0].1, vec!["a".to_string()]);
+    }
+
+    #[tokio::test]
+    async fn test_flush_all_triggers_all_keys() {
+        let writes = Arc::new(Mutex::new(Vec::new()));
+        let writer = MockWriter { writes: writes.clone() };
+        let appender: FileObjectAppender<String, String, MockWriter> =
+            FileObjectAppender::new(writer, NoopErrorHandler, Duration::from_secs(60), 100);
+
+        appender.append("key1".to_string(), vec!["a".to_string()]).await;
+        appender.append("key2".to_string(), vec!["b".to_string()]).await;
+        appender.flush_all().await;
+
+        tokio::time::sleep(Duration::from_millis(100)).await;
+
+        let writes = writes.lock().unwrap();
+        assert_eq!(writes.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn test_flush_key_nonexistent_key_is_noop() {
+        let writes = Arc::new(Mutex::new(Vec::new()));
+        let writer = MockWriter { writes: writes.clone() };
+        let appender: FileObjectAppender<String, String, MockWriter> =
+            FileObjectAppender::new(writer, NoopErrorHandler, Duration::from_secs(60), 100);
+
+        appender.flush_key(&"nonexistent".to_string()).await;
+        // No panic, no writes
     }
 }
