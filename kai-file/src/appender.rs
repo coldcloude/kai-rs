@@ -31,7 +31,7 @@ pub struct FileObjectAppender<K, R, W, E = NoopErrorHandler> {
 impl<K, R, W, E> FileObjectAppender<K, R, W, E>
 where
     K: Eq + std::hash::Hash + Clone + Send + Sync + 'static,
-    R: Send + 'static,
+    R: Clone + Send + 'static,
     W: FileAppendWriter<K, R>,
     E: ErrorHandler<K, R>,
 {
@@ -98,7 +98,7 @@ where
 impl<K, R, W, E> FileObjectAppender<K, R, W, E>
 where
     K: Eq + std::hash::Hash + Clone + Send + Sync + 'static,
-    R: Send + 'static,
+    R: Clone + Send + 'static,
     W: FileAppendWriter<K, R>,
     E: ErrorHandler<K, R>,
 {
@@ -141,8 +141,8 @@ where
             batch.extend(chunk);
         }
         if !batch.is_empty() {
-            if let Err(e) = writer.write(&key, batch).await {
-                error_handler.on_write_error(&key, Vec::new(), &e);
+            if let Err(e) = writer.write(&key, batch.clone()).await {
+                error_handler.on_write_error(&key, batch, &e);
             }
         }
     }
