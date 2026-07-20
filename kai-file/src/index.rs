@@ -136,14 +136,13 @@ impl FileIndices {
     pub async fn query_after<R: Record>(
         &self, file_path: impl AsRef<Path>, line: u32, n: u32,
     ) -> Result<Vec<(u32, R)>> {
-        if n == 0 || line >= self.end_line_index {
-            return if line >= self.end_line_index && self.end_line_index > 0 {
-                Err(crate::error::Error::ExternalError(
-                    format!("line {} out of range, end_line_index={}", line, self.end_line_index).into()
-                ))
-            } else {
-                Ok(Vec::new())
-            };
+        if n == 0 {
+            return Ok(Vec::new());
+        }
+        if line >= self.end_line_index {
+            return Err(crate::error::Error::ExternalError(
+                format!("line {} out of range, end_line_index={}", line, self.end_line_index).into()
+            ));
         }
 
         let page = (line / 1000) as usize;
@@ -169,7 +168,7 @@ impl FileIndices {
     pub async fn query_before<R: Record>(
         &self, file_path: impl AsRef<Path>, line: u32, n: u32,
     ) -> Result<Vec<(u32, R)>> {
-        if n == 0 || self.end_line_index == 0 {
+        if n == 0 {
             return Ok(Vec::new());
         }
         if line >= self.end_line_index {
