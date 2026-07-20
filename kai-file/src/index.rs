@@ -164,7 +164,7 @@ impl FileIndices {
     pub async fn query_before<R: Record>(
         &self, file_path: impl AsRef<Path>, line: u32, n: u32,
     ) -> Result<Vec<(u32, R)>> {
-        if n == 0 {
+        if n == 0 || self.end_line_index == 0 {
             return Ok(Vec::new());
         }
         if line >= self.end_line_index {
@@ -174,33 +174,21 @@ impl FileIndices {
         }
 
         let page = (line / 1000) as usize;
-        let mut remaining = n;
+        let end_byte = self.page_index.get(page + 1).copied().unwrap_or(self.end_pos);
+
+        let mut reader = ReverseLineReader::new(&file_path, None, Some(end_byte)).await?;
         let mut results = LinkedList::new();
-        let mut page_idx = page;
+        let mut cur_line = self.end_line_index.min((page as u32 + 1) * 1000);
 
-        loop {
-            let page_end_line = self.end_line_index.min((page_idx as u32 + 1) * 1000);
-            let end_byte = self.page_index.get(page_idx + 1).copied().unwrap_or(self.end_pos);
-            let start_byte = self.page_index.get(page_idx).copied().unwrap_or(0);
-
-            let mut reader = ReverseLineReader::new(&file_path, Some(start_byte), Some(end_byte)).await?;
-            let mut cur_line = page_end_line;
-            while let Some(line_with_pos) = reader.next_line().await? {
-                cur_line -= 1;
-                if cur_line <= line {
-                    let record = serde_json::from_str::<R>(line_with_pos.line.as_str())?;
-                    results.push_front((cur_line, record));
-                    remaining -= 1;
-                    if remaining == 0 {
-                        return Ok(results.into_iter().collect());
-                    }
+        while let Some(line_with_pos) = reader.next_line().await? {
+            cur_line -= 1;
+            if cur_line <= line {
+                let record = serde_json::from_str::<R>(line_with_pos.line.as_str())?;
+                results.push_front((cur_line, record));
+                if results.len() as u32 >= n {
+                    break;
                 }
             }
-
-            if page_idx == 0 {
-                break;
-            }
-            page_idx -= 1;
         }
 
         Ok(results.into_iter().collect())
