@@ -16,6 +16,9 @@ pub enum Error {
 
     #[error("External error: {0}")]
     ExternalError(Box<dyn std::error::Error + Send + Sync>),
+
+    #[error("Write error: {0}")]
+    WriteError(String),
 }
 
 pub type Result<T> = std::result::Result<T, Error>;

@@ -102,7 +102,7 @@ impl FileIndices {
 
     pub async fn query_by_time_range<R: Record>(
         &self, file_path: impl AsRef<Path>, start: &str, end: &str,
-    ) -> Result<Vec<(u32, R)>> {
+    ) -> Result<Vec<(u32, Arc<R>)>> {
         let minute_start = as_minute(start);
         let minute_end = as_minute(end);
         let entries: Vec<_> = self.time_index.range(minute_start.to_string()..=minute_end.to_string()).collect();
@@ -121,7 +121,7 @@ impl FileIndices {
         while let Some(line_with_pos) = reader.next_line().await? {
             let record = serde_json::from_str::<R>(line_with_pos.line.as_str())?;
             if record.time() >= start && record.time() <= end {
-                results.push((line_idx, record));
+                results.push((line_idx, Arc::new(record)));
             }
             line_idx += 1;
         }
@@ -131,7 +131,7 @@ impl FileIndices {
 
     pub async fn query_after<R: Record>(
         &self, file_path: impl AsRef<Path>, line: u32, n: u32,
-    ) -> Result<Vec<(u32, R)>> {
+    ) -> Result<Vec<(u32, Arc<R>)>> {
         if n == 0 {
             return Ok(Vec::new());
         }
@@ -153,7 +153,7 @@ impl FileIndices {
             }
             if line_idx >= line {
                 let record = serde_json::from_str::<R>(line_with_pos.line.as_str())?;
-                results.push((line_idx, record));
+                results.push((line_idx, Arc::new(record)));
             }
             line_idx += 1;
         }
@@ -163,7 +163,7 @@ impl FileIndices {
 
     pub async fn query_before<R: Record>(
         &self, file_path: impl AsRef<Path>, line: u32, n: u32,
-    ) -> Result<Vec<(u32, R)>> {
+    ) -> Result<Vec<(u32, Arc<R>)>> {
         if n == 0 || self.end_line_index == 0 {
             return Ok(Vec::new());
         }
@@ -184,7 +184,7 @@ impl FileIndices {
             cur_line -= 1;
             if cur_line <= line {
                 let record = serde_json::from_str::<R>(line_with_pos.line.as_str())?;
-                results.push_front((cur_line, record));
+                results.push_front((cur_line, Arc::new(record)));
                 if results.len() as u32 >= n {
                     break;
                 }
@@ -196,13 +196,13 @@ impl FileIndices {
 
     pub async fn query_first<R: Record>(
         &self, file_path: impl AsRef<Path>, n: u32,
-    ) -> Result<Vec<(u32, R)>> {
+    ) -> Result<Vec<(u32, Arc<R>)>> {
         self.query_after::<R>(file_path, 0, n).await
     }
 
     pub async fn query_last<R: Record>(
         &self, file_path: impl AsRef<Path>, n: u32,
-    ) -> Result<Vec<(u32, R)>> {
+    ) -> Result<Vec<(u32, Arc<R>)>> {
         if n == 0 || self.end_line_index == 0 {
             return Ok(Vec::new());
         }
@@ -298,7 +298,7 @@ where
         indices.update_all_index::<R>(file_path).await
     }
 
-    async fn query_by_time_range(&self, key: &K, start: &str, end: &str) -> Result<Vec<(u32, R)>> {
+    async fn query_by_time_range(&self, key: &K, start: &str, end: &str) -> Result<Vec<(u32, Arc<R>)>> {
         self.ensure_updated(key).await?;
         let file_path = self.parser.get_path(key).await?;
         let lock = self.get_lock(key);
@@ -306,7 +306,7 @@ where
         indices.query_by_time_range::<R>(file_path, start, end).await
     }
 
-    pub async fn query_all(&self, query: Q) -> Result<Vec<(K, Vec<(u32, R)>)>> {
+    pub async fn query_all(&self, query: Q) -> Result<Vec<(K, Vec<(u32, Arc<R>)>)>> {
         let mut key_with_range = self.parser.parse_query(query);
         let mut results = Vec::new();
         for (key, (start, end)) in key_with_range.drain(..) {
@@ -316,7 +316,7 @@ where
         Ok(results)
     }
 
-    pub async fn query_after(&self, key: &K, line: u32, n: u32) -> Result<Vec<(u32, R)>> {
+    pub async fn query_after(&self, key: &K, line: u32, n: u32) -> Result<Vec<(u32, Arc<R>)>> {
         self.ensure_updated(key).await?;
         let file_path = self.parser.get_path(key).await?;
         let lock = self.get_lock(key);
@@ -324,7 +324,7 @@ where
         indices.query_after::<R>(file_path, line, n).await
     }
 
-    pub async fn query_before(&self, key: &K, line: u32, n: u32) -> Result<Vec<(u32, R)>> {
+    pub async fn query_before(&self, key: &K, line: u32, n: u32) -> Result<Vec<(u32, Arc<R>)>> {
         self.ensure_updated(key).await?;
         let file_path = self.parser.get_path(key).await?;
         let lock = self.get_lock(key);
@@ -332,7 +332,7 @@ where
         indices.query_before::<R>(file_path, line, n).await
     }
 
-    pub async fn query_first(&self, key: &K, n: u32) -> Result<Vec<(u32, R)>> {
+    pub async fn query_first(&self, key: &K, n: u32) -> Result<Vec<(u32, Arc<R>)>> {
         self.ensure_updated(key).await?;
         let file_path = self.parser.get_path(key).await?;
         let lock = self.get_lock(key);
@@ -340,7 +340,7 @@ where
         indices.query_first::<R>(file_path, n).await
     }
 
-    pub async fn query_last(&self, key: &K, n: u32) -> Result<Vec<(u32, R)>> {
+    pub async fn query_last(&self, key: &K, n: u32) -> Result<Vec<(u32, Arc<R>)>> {
         self.ensure_updated(key).await?;
         let file_path = self.parser.get_path(key).await?;
         let lock = self.get_lock(key);

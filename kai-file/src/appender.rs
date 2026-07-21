@@ -1,20 +1,5 @@
 use async_trait::async_trait;
 
-#[async_trait]
-pub trait FileAppendWriter<K, R>: Send + Sync + 'static {
-    async fn write(&self, key: &K, records: Vec<R>) -> crate::error::Result<()>;
-}
-
-pub trait ErrorHandler<K, R>: Send + Sync + 'static {
-    fn on_write_error(&self, key: &K, batch: Vec<R>, error: &crate::error::Error);
-}
-
-pub struct NoopErrorHandler;
-
-impl<K, R> ErrorHandler<K, R> for NoopErrorHandler {
-    fn on_write_error(&self, _key: &K, _batch: Vec<R>, _error: &crate::error::Error) {}
-}
-
 use std::collections::{HashMap, LinkedList};
 use std::hash::Hash;
 use std::sync::Weak;
@@ -23,6 +8,23 @@ use std::sync::{Arc, atomic::AtomicUsize};
 use std::time::Duration;
 use dashmap::DashMap;
 use tokio::sync::{Mutex, Notify, RwLock, mpsc};
+
+use crate::error::{Error, Result};
+
+#[async_trait]
+pub trait FileAppendWriter<K, R>: Send + Sync + 'static {
+    async fn write(&self, key: &K, records: Vec<R>) -> Result<()>;
+}
+
+pub trait ErrorHandler<K, R>: Send + Sync + 'static {
+    fn on_write_error(&self, key: &K, batch: Vec<R>, error: &Error);
+}
+
+pub struct NoopErrorHandler;
+
+impl<K, R> ErrorHandler<K, R> for NoopErrorHandler {
+    fn on_write_error(&self, _key: &K, _batch: Vec<R>, _error: &Error) {}
+}
 
 pub struct FileWriteLocks<K> {
     map: HashMap<K, Weak<Mutex<()>>>,
@@ -99,15 +101,15 @@ pub struct FileObjectAppender<K, R, W, E = NoopErrorHandler> {
 
 impl<K, R, W, E> FileObjectAppender<K, R, W, E>
 where
-    K: Eq + std::hash::Hash + Clone + Send + Sync + 'static,
-    R: Clone + Send + 'static,
+    K: Eq + Hash + Clone + Send + Sync + 'static,
+    R: Clone + Send + Sync + 'static,
     W: FileAppendWriter<K, R>,
     E: ErrorHandler<K, R>,
 {
-    pub fn new(writer: W, error_handler: E, timeout: Duration, batch_size: usize) -> Self {
+    pub fn new(writer: Arc<W>, error_handler: Arc<E>, timeout: Duration, batch_size: usize) -> Self {
         Self {
-            writer: Arc::new(writer),
-            error_handler: Arc::new(error_handler),
+            writer,
+            error_handler,
             map: Arc::new(DashMap::new()),
             write_locks: Arc::new(RwLock::new(FileWriteLocks::new())),
             timeout,
@@ -206,7 +208,7 @@ mod tests {
     }
     #[async_trait]
     impl FileAppendWriter<String, String> for MockWriter {
-        async fn write(&self, key: &String, records: Vec<String>) -> crate::error::Result<()> {
+        async fn write(&self, key: &String, records: Vec<String>) -> Result<()> {
             self.writes.lock().unwrap().push((key.clone(), records));
             Ok(())
         }
@@ -217,16 +219,16 @@ mod tests {
         errors: Arc<Mutex<Vec<(String, Vec<String>, String)>>>,
     }
     impl ErrorHandler<String, String> for MockErrorHandler {
-        fn on_write_error(&self, key: &String, batch: Vec<String>, error: &crate::error::Error) {
+        fn on_write_error(&self, key: &String, batch: Vec<String>, error: &Error) {
             self.errors.lock().unwrap().push((key.clone(), batch, error.to_string()));
         }
     }
 
     #[tokio::test]
     async fn test_append_creates_sender_for_new_key() {
-        let writer = MockWriter { writes: Arc::new(Mutex::new(Vec::new())) };
+        let writer = Arc::new(MockWriter { writes: Arc::new(Mutex::new(Vec::new())) });
         let appender: FileObjectAppender<String, String, MockWriter> =
-            FileObjectAppender::new(writer, NoopErrorHandler, Duration::from_secs(1), 10);
+            FileObjectAppender::new(writer, Arc::new(NoopErrorHandler {}), Duration::from_secs(1), 10);
 
         appender.append("key1".to_string(), vec!["a".to_string()]).await;
         assert!(appender.map.contains_key("key1"));
@@ -234,9 +236,9 @@ mod tests {
 
     #[tokio::test]
     async fn test_append_empty_vec_is_noop() {
-        let writer = MockWriter { writes: Arc::new(Mutex::new(Vec::new())) };
+        let writer = Arc::new(MockWriter { writes: Arc::new(Mutex::new(Vec::new())) });
         let appender: FileObjectAppender<String, String, MockWriter> =
-            FileObjectAppender::new(writer, NoopErrorHandler, Duration::from_secs(1), 10);
+            FileObjectAppender::new(writer, Arc::new(NoopErrorHandler {}), Duration::from_secs(1), 10);
 
         appender.append("key1".to_string(), vec![]).await;
         assert!(!appender.map.contains_key("key1"));
@@ -244,9 +246,9 @@ mod tests {
 
     #[tokio::test]
     async fn test_append_reuses_existing_sender() {
-        let writer = MockWriter { writes: Arc::new(Mutex::new(Vec::new())) };
+        let writer = Arc::new(MockWriter { writes: Arc::new(Mutex::new(Vec::new())) });
         let appender: FileObjectAppender<String, String, MockWriter> =
-            FileObjectAppender::new(writer, NoopErrorHandler, Duration::from_secs(1), 10);
+            FileObjectAppender::new(writer, Arc::new(NoopErrorHandler {}), Duration::from_secs(1), 10);
 
         appender.append("key1".to_string(), vec!["a".to_string()]).await;
         let entry_count = appender.map.len();
@@ -257,9 +259,9 @@ mod tests {
     #[tokio::test]
     async fn test_flush_triggers_on_batch_size() {
         let writes = Arc::new(Mutex::new(Vec::new()));
-        let writer = MockWriter { writes: writes.clone() };
+        let writer = Arc::new(MockWriter { writes: writes.clone() });
         let appender: FileObjectAppender<String, String, MockWriter> =
-            FileObjectAppender::new(writer, NoopErrorHandler, Duration::from_secs(60), 2);
+            FileObjectAppender::new(writer, Arc::new(NoopErrorHandler {}), Duration::from_secs(60), 2);
 
         appender.append("key1".to_string(), vec!["a".to_string()]).await;
         appender.append("key1".to_string(), vec!["b".to_string()]).await;
@@ -275,9 +277,9 @@ mod tests {
     #[tokio::test]
     async fn test_flush_triggers_on_timeout() {
         let writes = Arc::new(Mutex::new(Vec::new()));
-        let writer = MockWriter { writes: writes.clone() };
+        let writer = Arc::new(MockWriter { writes: writes.clone() });
         let appender: FileObjectAppender<String, String, MockWriter> =
-            FileObjectAppender::new(writer, NoopErrorHandler, Duration::from_millis(50), 100);
+            FileObjectAppender::new(writer, Arc::new(NoopErrorHandler {}), Duration::from_millis(50), 100);
 
         appender.append("key1".to_string(), vec!["a".to_string()]).await;
 
@@ -293,17 +295,17 @@ mod tests {
         struct FailingWriter;
         #[async_trait]
         impl FileAppendWriter<String, String> for FailingWriter {
-            async fn write(&self, _key: &String, _records: Vec<String>) -> crate::error::Result<()> {
-                Err(crate::error::Error::ExternalError(
+            async fn write(&self, _key: &String, _records: Vec<String>) -> Result<()> {
+                Err(Error::IoError(
                     std::io::Error::new(std::io::ErrorKind::Other, "write failed").into(),
                 ))
             }
         }
 
         let errors = Arc::new(Mutex::new(Vec::new()));
-        let handler = MockErrorHandler { errors: errors.clone() };
+        let handler = Arc::new(MockErrorHandler { errors: errors.clone() });
         let appender: FileObjectAppender<String, String, FailingWriter, MockErrorHandler> =
-            FileObjectAppender::new(FailingWriter, handler, Duration::from_millis(50), 100);
+            FileObjectAppender::new(Arc::new(FailingWriter {}), handler, Duration::from_millis(50), 100);
 
         appender.append("key1".to_string(), vec!["a".to_string()]).await;
 
@@ -317,9 +319,9 @@ mod tests {
     #[tokio::test]
     async fn test_new_channel_created_after_flush() {
         let writes = Arc::new(Mutex::new(Vec::new()));
-        let writer = MockWriter { writes: writes.clone() };
+        let writer = Arc::new(MockWriter { writes: writes.clone() });
         let appender: FileObjectAppender<String, String, MockWriter> =
-            FileObjectAppender::new(writer, NoopErrorHandler, Duration::from_millis(50), 100);
+            FileObjectAppender::new(writer, Arc::new(NoopErrorHandler {}), Duration::from_millis(50), 100);
 
         appender.append("key1".to_string(), vec!["a".to_string()]).await;
         tokio::time::sleep(Duration::from_millis(200)).await;
