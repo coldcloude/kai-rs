@@ -8,4 +8,4 @@ pub use error::Error;
 pub use reverse_line_reader::{ReverseLineReader, LineWithPosition};
 pub use line_reader::LineReader;
 pub use index::FileIndexContext;
-pub use appender::{FileAppendWriter, ErrorHandler, NoopErrorHandler, FileObjectAppender};
+pub use appender::{FileAppendWriter, FileAppendWriterContext, ErrorHandler, NoopErrorHandler, FileObjectAppender};
