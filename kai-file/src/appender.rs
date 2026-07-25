@@ -22,7 +22,7 @@ where
 
 #[async_trait]
 pub trait FileAppendWriterContext<K, R>: Send + Sync + 'static {
-    async fn write(&mut self, key: &K, records: Vec<R>) -> Result<()>;
+    async fn write(&mut self, key: &K, mut records: Vec<R>) -> Result<()>;
 }
 
 #[async_trait]
