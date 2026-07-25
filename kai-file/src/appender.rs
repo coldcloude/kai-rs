@@ -165,6 +165,14 @@ where
             }
         }
     }
+
+    pub async fn get_lock(&self, key: &K) -> Arc<Mutex<C>> {
+        self.writer.get_lock(key).await
+    }
+
+    pub async fn remove_lock(&self, key: &K) {
+        self.writer.remove_lock(key).await
+    }
 }
 
 #[cfg(test)]
