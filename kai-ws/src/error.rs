@@ -18,6 +18,9 @@ pub enum Error {
 
     #[error("heartbeat handler already started")]
     HeartbeatHandlerAlreadyStarted,
+
+    #[error("invalid header: {0}")]
+    InvalidHeader(String),
 }
 
 pub type Result<T> = std::result::Result<T, Error>;

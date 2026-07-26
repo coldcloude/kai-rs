@@ -5,8 +5,8 @@ use dashmap::DashMap;
 use flume::{Receiver, Sender, bounded};
 use serde::{Deserialize, Serialize};
 use bytes::{BufMut, Bytes, BytesMut};
-use tokio::{net::TcpStream, time::{Duration, Instant}};
-use tokio_tungstenite::{accept_async, accept_hdr_async, tungstenite::{Message, Utf8Bytes}};
+use tokio::{net::TcpStream, time::{Duration, Instant}, io::{AsyncRead, AsyncWrite}};
+use tokio_tungstenite::{WebSocketStream, accept_async, accept_hdr_async, connect_async, tungstenite::{Message, Utf8Bytes, client::IntoClientRequest}};
 use futures_util::{SinkExt, StreamExt};
 use tracing::{Level, error, span};
 
@@ -239,26 +239,11 @@ async fn ws_handle_close(recv_ctx: Arc<WsContext>) -> Result<()> {
     Ok(())
 }
 
-/// 建立 WebSocket 连接，在握手阶段使用 filter 对 HTTP 请求头进行校验。
-/// filter 按顺序执行，全部通过才建立连接；任一 filter 拒绝则连接关闭。
-pub async fn ws_handle_connection_with_filter<I, P>(stream: TcpStream, queue_capacity: usize, processor_context: Arc<P>, initializer: &I, filters: &[&dyn WsHeaderFilter]) -> Result<()>
+/// 启动 ws 收/发两个后台任务，服务端与客户端连接共用。
+fn spawn_ws_tasks<S>(ws_stream: WebSocketStream<S>, context: Arc<WsContext>)
 where
-    I: WsProcessorInitializer<P>,
+    S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
 {
-    let ws_stream = if !filters.is_empty() {
-        accept_hdr_async(stream, |request: &http::Request<()>, response: http::Response<()>| {
-            for filter in filters {
-                if let Err(err_response) = filter.filter(request) {
-                    return Err(err_response);
-                }
-            }
-            Ok(response)
-        }).await?
-    } else {
-        accept_async(stream).await?
-    };
-    let context = Arc::new(WsContext::new(queue_capacity));
-    initializer.init(context.clone(), processor_context).await?;
     let (mut sender, mut receiver) = ws_stream.split();
     let recv_ctx = context.clone();
     let send_ctx = context.clone();
@@ -336,6 +321,29 @@ where
             }
         }
     });
+}
+
+/// 建立 WebSocket 连接，在握手阶段使用 filter 对 HTTP 请求头进行校验。
+/// filter 按顺序执行，全部通过才建立连接；任一 filter 拒绝则连接关闭。
+pub async fn ws_handle_connection_with_filter<I, P>(stream: TcpStream, queue_capacity: usize, processor_context: Arc<P>, initializer: &I, filters: &[&dyn WsHeaderFilter]) -> Result<()>
+where
+    I: WsProcessorInitializer<P>,
+{
+    let ws_stream = if !filters.is_empty() {
+        accept_hdr_async(stream, |request: &http::Request<()>, response: http::Response<()>| {
+            for filter in filters {
+                if let Err(err_response) = filter.filter(request) {
+                    return Err(err_response);
+                }
+            }
+            Ok(response)
+        }).await?
+    } else {
+        accept_async(stream).await?
+    };
+    let context = Arc::new(WsContext::new(queue_capacity));
+    initializer.init(context.clone(), processor_context).await?;
+    spawn_ws_tasks(ws_stream, context);
     Ok(())
 }
 
@@ -345,6 +353,28 @@ where
     I: WsProcessorInitializer<P>,
 {
     ws_handle_connection_with_filter(stream, queue_capacity, processor_context, initializer, &[]).await
+}
+
+/// 作为客户端建立 WebSocket 连接。
+/// headers 用于握手阶段携带自定义请求头（如 X-Api-Key 认证）。
+/// 与服务端 ws_handle_connection 对称：创建 WsContext、执行 initializer、启动收发循环。
+pub async fn ws_connect<I, P>(url: &str, headers: &[(String, String)], queue_capacity: usize, processor_context: Arc<P>, initializer: &I) -> Result<Arc<WsContext>>
+where
+    I: WsProcessorInitializer<P>,
+{
+    let mut request = url.into_client_request()?;
+    for (name, value) in headers {
+        let header_name = http::HeaderName::from_bytes(name.as_bytes())
+            .map_err(|_| Error::InvalidHeader(format!("invalid header name: {}", name)))?;
+        let header_value = http::HeaderValue::from_str(value)
+            .map_err(|_| Error::InvalidHeader(format!("invalid header value: {}", value)))?;
+        request.headers_mut().insert(header_name, header_value);
+    }
+    let (ws_stream, _) = connect_async(request).await?;
+    let context = Arc::new(WsContext::new(queue_capacity));
+    initializer.init(context.clone(), processor_context).await?;
+    spawn_ws_tasks(ws_stream, context.clone());
+    Ok(context)
 }
 
 pub struct WsHeartbeatHandler {
@@ -979,5 +1009,127 @@ mod tests {
         let err_response = result.unwrap_err();
         assert_eq!(err_response.status(), http::StatusCode::UNAUTHORIZED);
         assert_eq!(err_response.body(), &Some("not allowed".to_string()));
+    }
+
+    // === Group 7: ws_connect client tests ===
+
+    use tokio::net::TcpListener;
+
+    struct EchoServerCtx;
+
+    struct EchoServerInitializer;
+
+    #[async_trait]
+    impl WsProcessorInitializer<EchoServerCtx> for EchoServerInitializer {
+        async fn init(&self, ws_context: Arc<WsContext>, _ctx: Arc<EchoServerCtx>) -> Result<()> {
+            struct EchoProcessor;
+
+            #[async_trait]
+            impl WsJsonProcessor for EchoProcessor {
+                async fn process_json(&self, data: WsMessage, context: Arc<WsContext>) {
+                    context.send_json(WsMessage {
+                        sn: data.sn,
+                        status_code: CODE_SUCCESS,
+                        payload_type: TYPE_RESPONSE,
+                        payload: data.payload,
+                    }).await.unwrap();
+                }
+            }
+
+            ws_context.set_json_processor(42, Arc::new(EchoProcessor));
+            Ok(())
+        }
+    }
+
+    struct EmptyClientCtx;
+
+    struct EmptyClientInitializer;
+
+    #[async_trait]
+    impl WsProcessorInitializer<EmptyClientCtx> for EmptyClientInitializer {
+        async fn init(&self, _ws_context: Arc<WsContext>, _ctx: Arc<EmptyClientCtx>) -> Result<()> {
+            Ok(())
+        }
+    }
+
+    struct OneShotResponseHandler {
+        tx: Option<tokio::sync::oneshot::Sender<WsMessage>>,
+    }
+
+    #[async_trait]
+    impl WsJsonProcessorMut for OneShotResponseHandler {
+        async fn process_json(mut self: Box<Self>, data: WsMessage, _context: Arc<WsContext>) {
+            if let Some(tx) = self.tx.take() {
+                let _ = tx.send(data);
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn test_ws_connect_json_roundtrip() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            ws_handle_connection(stream, 16, Arc::new(EchoServerCtx), &EchoServerInitializer).await.unwrap();
+        });
+
+        let ctx = ws_connect(&format!("ws://{}", addr), &[], 16, Arc::new(EmptyClientCtx), &EmptyClientInitializer)
+            .await.unwrap();
+
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        let req = WsMessage {
+            sn: ctx.next_request_sn(),
+            payload_type: 42,
+            status_code: CODE_SUCCESS,
+            payload: Some(serde_json::json!({"hello": "world"})),
+        };
+        ctx.send_json_with_json_response(req, Box::new(OneShotResponseHandler { tx: Some(tx) })).await.unwrap();
+
+        let resp = tokio::time::timeout(Duration::from_secs(2), rx).await.unwrap().unwrap();
+        assert_eq!(resp.payload_type, TYPE_RESPONSE);
+        assert_eq!(resp.payload, Some(serde_json::json!({"hello": "world"})));
+    }
+
+    #[tokio::test]
+    async fn test_ws_connect_with_header() {
+        struct RequireHeaderFilter;
+
+        impl WsHeaderFilter for RequireHeaderFilter {
+            fn filter(&self, request: &http::Request<()>) -> std::result::Result<(), http::Response<Option<String>>> {
+                match request.headers().get("X-Test-Key").and_then(|v| v.to_str().ok()) {
+                    Some("yes") => Ok(()),
+                    _ => Err(http::Response::builder()
+                        .status(http::StatusCode::UNAUTHORIZED)
+                        .body(Some("missing header".to_string()))
+                        .unwrap()),
+                }
+            }
+        }
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let filter = RequireHeaderFilter;
+
+        tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            ws_handle_connection_with_filter(stream, 16, Arc::new(EchoServerCtx), &EchoServerInitializer, &[&filter]).await.unwrap();
+        });
+
+        let headers = [("X-Test-Key".to_string(), "yes".to_string())];
+        let ctx = ws_connect(&format!("ws://{}", addr), &headers, 16, Arc::new(EmptyClientCtx), &EmptyClientInitializer)
+            .await.unwrap();
+
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        let req = WsMessage {
+            sn: ctx.next_request_sn(),
+            payload_type: 42,
+            status_code: CODE_SUCCESS,
+            payload: None,
+        };
+        ctx.send_json_with_json_response(req, Box::new(OneShotResponseHandler { tx: Some(tx) })).await.unwrap();
+        let resp = tokio::time::timeout(Duration::from_secs(2), rx).await.unwrap().unwrap();
+        assert_eq!(resp.payload_type, TYPE_RESPONSE);
     }
 }
