@@ -281,6 +281,11 @@ where
         }
         //处理关闭回调
         if let Ok(true) = recv_running.compare_exchange(true, false, Ordering::Relaxed, Ordering::Relaxed) {
+            // 关闭发送队列，让发送循环退出（同时触发 tungstenite 的 close handshake 完成）
+            // 注：不使用 Sender::close 避免与 SinkExt::close 的 trait 方法冲突，改用 try_send 无实质发——
+            // 直接丢弃发送端即可；由于无法从 recv 任务访问，改用单独的关闭信号。
+            // 当前方案：放一个 Close 消息到队列中（若队列满则忽略），让 send 循环处理。
+            let _ = recv_ctx.sending_queue.0.try_send(WsMessageUnion::Close);
             if let Err(e) = ws_handle_close(recv_ctx.clone()).await {
                 error!("Error handling close message: {:?}", e);
             }
@@ -291,9 +296,20 @@ where
     tokio::task::spawn(async move {
         let span = span!(Level::INFO, "ws sending process");
         let _enter = span.enter();
-        while send_running.load(Ordering::Relaxed) {
-            let Ok(msg) = send_ctx.sending_queue.1.recv_async().await else {
-                break;
+        'send_loop: loop {
+            let msg = tokio::select! {
+                msg = send_ctx.sending_queue.1.recv_async() => {
+                    match msg {
+                        Ok(msg) => msg,
+                        Err(_) => break 'send_loop,
+                    }
+                }
+                _ = tokio::time::sleep(std::time::Duration::from_millis(200)) => {
+                    if !send_running.load(Ordering::Relaxed) {
+                        break 'send_loop;
+                    }
+                    continue 'send_loop;
+                }
             };
             match msg {
                 WsMessageUnion::Json(msg) => {
@@ -317,6 +333,8 @@ where
                     if let Err(e) = sender.send(Message::Close(None)).await {
                         error!("Error sending close message: {:?}", e);
                     }
+                    // 发送 Close 后退出循环
+                    break 'send_loop;
                 }
             }
         }
