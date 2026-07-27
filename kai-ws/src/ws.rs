@@ -167,8 +167,8 @@ impl WsContext {
 }
 
 #[async_trait]
-pub trait WsProcessorInitializer<P>: Send + Sync {
-    async fn init(&self, ws_context: Arc<WsContext>, processor_context: Arc<P>) -> Result<()>;
+pub trait WsProcessorContext: Send + Sync {
+    async fn init(self: Arc<Self>, ws_context: Arc<WsContext>) -> Result<()>;
 }
 
 /// WSS 握手阶段请求头过滤器。
@@ -343,10 +343,7 @@ where
 
 /// 建立 WebSocket 连接，在握手阶段使用 filter 对 HTTP 请求头进行校验。
 /// filter 按顺序执行，全部通过才建立连接；任一 filter 拒绝则连接关闭。
-pub async fn ws_handle_connection_with_filter<I, P>(stream: TcpStream, queue_capacity: usize, processor_context: Arc<P>, initializer: &I, filters: &[&dyn WsHeaderFilter]) -> Result<()>
-where
-    I: WsProcessorInitializer<P>,
-{
+pub async fn ws_handle_connection_with_filter<C: WsProcessorContext>(stream: TcpStream, queue_capacity: usize, processor_context: Arc<C>, filters: &[&dyn WsHeaderFilter]) -> Result<()> {
     let ws_stream = if !filters.is_empty() {
         accept_hdr_async(stream, |request: &http::Request<()>, response: http::Response<()>| {
             for filter in filters {
@@ -360,26 +357,20 @@ where
         accept_async(stream).await?
     };
     let context = Arc::new(WsContext::new(queue_capacity));
-    initializer.init(context.clone(), processor_context).await?;
+    processor_context.init(context.clone()).await?;
     spawn_ws_tasks(ws_stream, context);
     Ok(())
 }
 
 /// 建立 WebSocket 连接，不使用请求头过滤。
-pub async fn ws_handle_connection<I, P>(stream: TcpStream, queue_capacity: usize, processor_context: Arc<P>, initializer: &I) -> Result<()>
-where
-    I: WsProcessorInitializer<P>,
-{
-    ws_handle_connection_with_filter(stream, queue_capacity, processor_context, initializer, &[]).await
+pub async fn ws_handle_connection<C: WsProcessorContext>(stream: TcpStream, queue_capacity: usize, processor_context: Arc<C>) -> Result<()> {
+    ws_handle_connection_with_filter(stream, queue_capacity, processor_context, &[]).await
 }
 
 /// 作为客户端建立 WebSocket 连接。
 /// headers 用于握手阶段携带自定义请求头（如 X-Api-Key 认证）。
 /// 与服务端 ws_handle_connection 对称：创建 WsContext、执行 initializer、启动收发循环。
-pub async fn ws_connect<I, P>(url: &str, headers: &[(String, String)], queue_capacity: usize, processor_context: Arc<P>, initializer: &I) -> Result<Arc<WsContext>>
-where
-    I: WsProcessorInitializer<P>,
-{
+pub async fn ws_connect<C: WsProcessorContext>(url: &str, headers: &[(String, String)], queue_capacity: usize, processor_context: Arc<C>) -> Result<()> {
     let mut request = url.into_client_request()?;
     for (name, value) in headers {
         let header_name = http::HeaderName::from_bytes(name.as_bytes())
@@ -390,9 +381,9 @@ where
     }
     let (ws_stream, _) = connect_async(request).await?;
     let context = Arc::new(WsContext::new(queue_capacity));
-    initializer.init(context.clone(), processor_context).await?;
+    processor_context.init(context.clone()).await?;
     spawn_ws_tasks(ws_stream, context.clone());
-    Ok(context)
+    Ok(())
 }
 
 pub struct WsHeartbeatHandler {
@@ -1035,11 +1026,9 @@ mod tests {
 
     struct EchoServerCtx;
 
-    struct EchoServerInitializer;
-
     #[async_trait]
-    impl WsProcessorInitializer<EchoServerCtx> for EchoServerInitializer {
-        async fn init(&self, ws_context: Arc<WsContext>, _ctx: Arc<EchoServerCtx>) -> Result<()> {
+    impl WsProcessorContext for EchoServerCtx {
+        async fn init(self: Arc<Self>, ws_context: Arc<WsContext>) -> Result<()> {
             struct EchoProcessor;
 
             #[async_trait]
@@ -1059,14 +1048,21 @@ mod tests {
         }
     }
 
-    struct EmptyClientCtx;
-
-    struct EmptyClientInitializer;
+    struct EmptyClientCtx {
+        ws: tokio::sync::Mutex<Option<Arc<WsContext>>>,
+    }
 
     #[async_trait]
-    impl WsProcessorInitializer<EmptyClientCtx> for EmptyClientInitializer {
-        async fn init(&self, _ws_context: Arc<WsContext>, _ctx: Arc<EmptyClientCtx>) -> Result<()> {
+    impl WsProcessorContext for EmptyClientCtx {
+        async fn init(self: Arc<Self>, ws_context: Arc<WsContext>) -> Result<()> {
+            *self.ws.lock().await = Some(ws_context);
             Ok(())
+        }
+    }
+
+    impl EmptyClientCtx {
+        async fn ws(&self) -> Arc<WsContext> {
+            self.ws.lock().await.clone().unwrap()
         }
     }
 
@@ -1090,11 +1086,13 @@ mod tests {
 
         tokio::spawn(async move {
             let (stream, _) = listener.accept().await.unwrap();
-            ws_handle_connection(stream, 16, Arc::new(EchoServerCtx), &EchoServerInitializer).await.unwrap();
+            ws_handle_connection(stream, 16, Arc::new(EchoServerCtx)).await.unwrap();
         });
 
-        let ctx = ws_connect(&format!("ws://{}", addr), &[], 16, Arc::new(EmptyClientCtx), &EmptyClientInitializer)
+        let client_ctx = Arc::new(EmptyClientCtx { ws: tokio::sync::Mutex::new(None) });
+        ws_connect(&format!("ws://{}", addr), &[], 16, client_ctx.clone())
             .await.unwrap();
+        let ctx = client_ctx.ws().await;
 
         let (tx, rx) = tokio::sync::oneshot::channel();
         let req = WsMessage {
@@ -1132,12 +1130,14 @@ mod tests {
 
         tokio::spawn(async move {
             let (stream, _) = listener.accept().await.unwrap();
-            ws_handle_connection_with_filter(stream, 16, Arc::new(EchoServerCtx), &EchoServerInitializer, &[&filter]).await.unwrap();
+            ws_handle_connection_with_filter(stream, 16, Arc::new(EchoServerCtx), &[&filter]).await.unwrap();
         });
 
         let headers = [("X-Test-Key".to_string(), "yes".to_string())];
-        let ctx = ws_connect(&format!("ws://{}", addr), &headers, 16, Arc::new(EmptyClientCtx), &EmptyClientInitializer)
+        let client_ctx = Arc::new(EmptyClientCtx { ws: tokio::sync::Mutex::new(None) });
+        ws_connect(&format!("ws://{}", addr), &headers, 16, client_ctx.clone())
             .await.unwrap();
+        let ctx = client_ctx.ws().await;
 
         let (tx, rx) = tokio::sync::oneshot::channel();
         let req = WsMessage {
