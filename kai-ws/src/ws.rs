@@ -13,8 +13,7 @@ use tracing::{Level, error, span};
 use crate::{Error, error::Result};
 
 pub const TYPE_RESPONSE: u32 = 0x00000000;
-
-pub const TYPE_HEARTBEAT: u32 = 0x00000000;
+pub const TYPE_HEARTBEAT: u32 = 0x00000001;
 
 pub const CODE_SUCCESS: u32 = 200;
 pub const CODE_ERROR: u32 = 500;
