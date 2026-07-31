@@ -110,8 +110,9 @@ mod tests {
 
     async fn write_file(dir: &tempfile::TempDir, name: &str, content: &[u8]) -> std::path::PathBuf {
         let path = dir.path().join(name);
-        let mut file = File::create(&path).await.unwrap();
-        file.write_all(content).await.unwrap();
+        // 同步写：tokio 异步 write_all 与随后的 open 存在可见性竞态（偶发读到空文件），
+        // 测试必须用同步写保证写入完成后读方能观察到数据
+        std::fs::write(&path, content).unwrap();
         path
     }
 
@@ -377,6 +378,92 @@ mod tests {
         let third = reader.next_line().await.unwrap().unwrap();
         assert_eq!(third.line, "end");
         assert_eq!(reader.next_line().await.unwrap(), None);
+    }
+
+    /// 回归测试：行跨越 BUFFER_SIZE(4096) chunk 边界时，正向读取内容与位置完整不丢失
+    #[tokio::test]
+    async fn test_lines_crossing_chunk_boundary() {
+        let dir = tempdir().unwrap();
+        let file_path = dir.path().join("chunk_cross.txt");
+
+        // 每行 300 字节（"Lxx-" 4 字符 + 295 填充 + '\n'），共 20 行 6000 字节 > BUFFER_SIZE，
+        // 行边界会落在 chunk 边界两侧（第 4096 字节落在某行内部）
+        let line_len = 300usize;
+        let mut content: Vec<u8> = Vec::new();
+        let mut expected: Vec<(String, u64, u64)> = Vec::new();
+        for i in 0..20 {
+            let mut line = format!("L{:02}-{}", i, "a".repeat(line_len - 5));
+            let start = content.len() as u64;
+            content.extend_from_slice(line.as_bytes());
+            content.push(b'\n');
+            let end = content.len() as u64;
+            expected.push((line, start, end));
+        }
+        assert!(content.len() > BUFFER_SIZE);
+        let path = write_file(&dir, "chunk_cross.txt", &content).await;
+
+        let mut reader = LineReader::new(&path, None, None).await.unwrap();
+        let mut got: Vec<(String, u64, u64)> = Vec::new();
+        while let Some(lp) = reader.next_line().await.unwrap() {
+            got.push((lp.line, lp.start_pos, lp.end_pos));
+        }
+        assert_eq!(got, expected, "跨块读取结果与预期不一致");
+    }
+
+    /// 回归测试：换行符恰好落在 chunk 边界（文件总长 = BUFFER_SIZE，末字节为 \n）
+    #[tokio::test]
+    async fn test_lines_ending_at_chunk_boundary() {
+        let dir = tempdir().unwrap();
+        let file_path = dir.path().join("chunk_boundary.txt");
+
+        // 每行 256 字节，16 行共 4096 字节：第 16 行的 '\n' 恰好是文件最后一个字节
+        let line_len = 256usize;
+        let mut content: Vec<u8> = Vec::new();
+        let mut expected: Vec<(String, u64, u64)> = Vec::new();
+        for i in 0..16 {
+            let mut line = format!("B{:02}-{}", i, "b".repeat(line_len - 5));
+            let start = content.len() as u64;
+            content.extend_from_slice(line.as_bytes());
+            content.push(b'\n');
+            let end = content.len() as u64;
+            expected.push((line, start, end));
+        }
+        assert_eq!(content.len(), BUFFER_SIZE);
+        let path = write_file(&dir, "chunk_boundary.txt", &content).await;
+
+        let mut reader = LineReader::new(&path, None, None).await.unwrap();
+        let mut got: Vec<(String, u64, u64)> = Vec::new();
+        while let Some(lp) = reader.next_line().await.unwrap() {
+            got.push((lp.line, lp.start_pos, lp.end_pos));
+        }
+        assert_eq!(got, expected, "边界对齐行读取结果与预期不一致");
+    }
+
+    /// 回归测试：从非块边界位置（8 行 * 256 = 2048）开始读取，后续行内容与位置完整
+    #[tokio::test]
+    async fn test_custom_start_at_chunk_boundary() {
+        let dir = tempdir().unwrap();
+        let file_path = dir.path().join("chunk_start.txt");
+
+        let line_len = 256usize;
+        let mut content: Vec<u8> = Vec::new();
+        let mut expected: Vec<(String, u64, u64)> = Vec::new();
+        for i in 0..16 {
+            let mut line = format!("C{:02}-{}", i, "c".repeat(line_len - 5));
+            content.extend_from_slice(line.as_bytes());
+            content.push(b'\n');
+            expected.push((line, (i * line_len) as u64, ((i + 1) * line_len) as u64));
+        }
+        let path = write_file(&dir, "chunk_start.txt", &content).await;
+
+        // 从 2048 开始读（位于第二个 chunk 内），验证跨 chunk 的 start_pos 语义
+        let start = 8 * line_len as u64;
+        let mut reader = LineReader::new(&path, Some(start), None).await.unwrap();
+        let mut got: Vec<(String, u64, u64)> = Vec::new();
+        while let Some(lp) = reader.next_line().await.unwrap() {
+            got.push((lp.line, lp.start_pos, lp.end_pos));
+        }
+        assert_eq!(got, expected[8..], "从 chunk 中间位置开始读取结果与预期不一致");
     }
 
     #[tokio::test]

@@ -101,12 +101,15 @@ impl ReverseLineReader {
                 }
             }
 
-            //buffer已搜索完，文件到达开头，输出剩余buffer
-            if self.current_pos == self.file_start_pos {
-                if self.buffer_end > 0 {
-                    self.save_buffer(0, self.buffer_end);
-                }
+            //buffer已搜索完，无换行符：整块是当前行的一部分（行跨 chunk），
+            //先保存为片段，再继续往前读，避免覆盖丢失
+            if self.buffer_end > 0 {
+                self.save_buffer(0, self.buffer_end);
                 self.buffer_end = 0;
+            }
+
+            //文件到达开头，输出剩余buffer
+            if self.current_pos == self.file_start_pos {
                 return self.pop_line_without_newline();
             }
 
@@ -123,16 +126,20 @@ impl ReverseLineReader {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use tokio::io::AsyncWriteExt;
     use tempfile::tempdir;
+
+    /// 测试辅助：同步写文件。tokio 异步 write_all 与随后的 open 存在可见性竞态
+    /// （偶发读到空文件，见 race probe），测试必须用同步写保证写入完成后读方能观察到数据
+    fn write_test_file(path: &std::path::Path, content: &[u8]) {
+        std::fs::write(path, content).unwrap();
+    }
 
     #[tokio::test]
     async fn test_reverse_line_reader() {
         let dir = tempdir().unwrap();
         let file_path = dir.path().join("test.txt");
 
-        let mut file = File::create(&file_path).await.unwrap();
-        file.write_all(b"line 1\nline 2\r\nline 3\nline 4").await.unwrap();
+        write_test_file(&file_path, b"line 1\nline 2\r\nline 3\nline 4");
 
         let mut reader = ReverseLineReader::new(&file_path, None, None).await.unwrap();
 
@@ -163,8 +170,7 @@ mod tests {
     async fn test_empty_file() {
         let dir = tempdir().unwrap();
         let file_path = dir.path().join("empty.txt");
-        File::create(&file_path).await.unwrap();
-
+        std::fs::File::create(&file_path).unwrap();
         let mut reader = ReverseLineReader::new(&file_path, None, None).await.unwrap();
         assert_eq!(reader.next_line().await.unwrap(), None);
     }
@@ -174,8 +180,7 @@ mod tests {
         let dir = tempdir().unwrap();
         let file_path = dir.path().join("single.txt");
 
-        let mut file = File::create(&file_path).await.unwrap();
-        file.write_all(b"single line").await.unwrap();
+        write_test_file(&file_path, b"single line");
 
         let mut reader = ReverseLineReader::new(&file_path, None, None).await.unwrap();
         assert_eq!(reader.next_line().await.unwrap(), Some(LineWithPosition {
@@ -191,8 +196,7 @@ mod tests {
         let dir = tempdir().unwrap();
         let file_path = dir.path().join("ends_with_newline.txt");
 
-        let mut file = File::create(&file_path).await.unwrap();
-        file.write_all(b"line 1\nline 2\n").await.unwrap();
+        write_test_file(&file_path, b"line 1\nline 2\n");
 
         let mut reader = ReverseLineReader::new(&file_path, None, None).await.unwrap();
         assert_eq!(reader.next_line().await.unwrap(), Some(LineWithPosition {
@@ -213,8 +217,7 @@ mod tests {
         let dir = tempdir().unwrap();
         let file_path = dir.path().join("ends_with_crlf.txt");
 
-        let mut file = File::create(&file_path).await.unwrap();
-        file.write_all(b"line 1\r\nline 2\r\n").await.unwrap();
+        write_test_file(&file_path, b"line 1\r\nline 2\r\n");
 
         let mut reader = ReverseLineReader::new(&file_path, None, None).await.unwrap();
         assert_eq!(reader.next_line().await.unwrap(), Some(LineWithPosition {
@@ -235,8 +238,7 @@ mod tests {
         let dir = tempdir().unwrap();
         let file_path = dir.path().join("ends_with_double_newline.txt");
 
-        let mut file = File::create(&file_path).await.unwrap();
-        file.write_all(b"line 1\nline 2\n\n").await.unwrap();
+        write_test_file(&file_path, b"line 1\nline 2\n\n");
 
         let mut reader = ReverseLineReader::new(&file_path, None, None).await.unwrap();
         assert_eq!(reader.next_line().await.unwrap(), Some(LineWithPosition {
@@ -262,8 +264,7 @@ mod tests {
         let dir = tempdir().unwrap();
         let file_path = dir.path().join("ends_with_double_crlf.txt");
 
-        let mut file = File::create(&file_path).await.unwrap();
-        file.write_all(b"line 1\r\nline 2\r\n\r\n").await.unwrap();
+        write_test_file(&file_path, b"line 1\r\nline 2\r\n\r\n");
 
         let mut reader = ReverseLineReader::new(&file_path, None, None).await.unwrap();
         assert_eq!(reader.next_line().await.unwrap(), Some(LineWithPosition {
@@ -289,8 +290,7 @@ mod tests {
         let dir = tempdir().unwrap();
         let file_path = dir.path().join("empty_lines_in_middle.txt");
 
-        let mut file = File::create(&file_path).await.unwrap();
-        file.write_all(b"line 1\n\nline 2\nline 3").await.unwrap();
+        write_test_file(&file_path, b"line 1\n\nline 2\nline 3");
 
         let mut reader = ReverseLineReader::new(&file_path, None, None).await.unwrap();
         assert_eq!(reader.next_line().await.unwrap(), Some(LineWithPosition {
@@ -321,8 +321,7 @@ mod tests {
         let dir = tempdir().unwrap();
         let file_path = dir.path().join("empty_lines_in_middle_crlf.txt");
 
-        let mut file = File::create(&file_path).await.unwrap();
-        file.write_all(b"line 1\r\n\r\nline 2\r\nline 3").await.unwrap();
+        write_test_file(&file_path, b"line 1\r\n\r\nline 2\r\nline 3");
 
         let mut reader = ReverseLineReader::new(&file_path, None, None).await.unwrap();
         assert_eq!(reader.next_line().await.unwrap(), Some(LineWithPosition {
@@ -353,8 +352,7 @@ mod tests {
         let dir = tempdir().unwrap();
         let file_path = dir.path().join("only_newline.txt");
 
-        let mut file = File::create(&file_path).await.unwrap();
-        file.write_all(b"\n").await.unwrap();
+        write_test_file(&file_path, b"\n");
 
         let mut reader = ReverseLineReader::new(&file_path, None, None).await.unwrap();
         assert_eq!(reader.next_line().await.unwrap(), Some(LineWithPosition {
@@ -370,8 +368,7 @@ mod tests {
         let dir = tempdir().unwrap();
         let file_path = dir.path().join("only_crlf.txt");
 
-        let mut file = File::create(&file_path).await.unwrap();
-        file.write_all(b"\r\n").await.unwrap();
+        write_test_file(&file_path, b"\r\n");
 
         let mut reader = ReverseLineReader::new(&file_path, None, None).await.unwrap();
         assert_eq!(reader.next_line().await.unwrap(), Some(LineWithPosition {
@@ -387,8 +384,7 @@ mod tests {
         let dir = tempdir().unwrap();
         let file_path = dir.path().join("only_two_newlines.txt");
 
-        let mut file = File::create(&file_path).await.unwrap();
-        file.write_all(b"\n\n").await.unwrap();
+        write_test_file(&file_path, b"\n\n");
 
         let mut reader = ReverseLineReader::new(&file_path, None, None).await.unwrap();
         assert_eq!(reader.next_line().await.unwrap(), Some(LineWithPosition {
@@ -409,8 +405,7 @@ mod tests {
         let dir = tempdir().unwrap();
         let file_path = dir.path().join("only_two_crlfs.txt");
 
-        let mut file = File::create(&file_path).await.unwrap();
-        file.write_all(b"\r\n\r\n").await.unwrap();
+        write_test_file(&file_path, b"\r\n\r\n");
 
         let mut reader = ReverseLineReader::new(&file_path, None, None).await.unwrap();
         assert_eq!(reader.next_line().await.unwrap(), Some(LineWithPosition {
@@ -431,8 +426,7 @@ mod tests {
         let dir = tempdir().unwrap();
         let file_path = dir.path().join("test.txt");
 
-        let mut file = File::create(&file_path).await.unwrap();
-        file.write_all("第一行\n第二行\r\n第三行\n第四行".as_bytes()).await.unwrap();
+        write_test_file(&file_path, "第一行\n第二行\r\n第三行\n第四行".as_bytes());
 
         let mut reader = ReverseLineReader::new(&file_path, Some(13), None).await.unwrap();
 
@@ -459,8 +453,7 @@ mod tests {
         let dir = tempdir().unwrap();
         let file_path = dir.path().join("test.txt");
 
-        let mut file = File::create(&file_path).await.unwrap();
-        file.write_all("第一行\n第二行\r\n第三行\n第四行".as_bytes()).await.unwrap();
+        write_test_file(&file_path, "第一行\n第二行\r\n第三行\n第四行".as_bytes());
 
         let mut reader = ReverseLineReader::new(&file_path, None, Some(27)).await.unwrap();
 
@@ -487,8 +480,7 @@ mod tests {
         let dir = tempdir().unwrap();
         let file_path = dir.path().join("test.txt");
 
-        let mut file = File::create(&file_path).await.unwrap();
-        file.write_all("第一行\n第二行\r\n第三行\n第四行".as_bytes()).await.unwrap();
+        write_test_file(&file_path, "第一行\n第二行\r\n第三行\n第四行".as_bytes());
 
         let mut reader = ReverseLineReader::new(&file_path, Some(13), Some(27)).await.unwrap();
 
@@ -503,5 +495,78 @@ mod tests {
             end_pos: 21,
         }));
         assert_eq!(reader.next_line().await.unwrap(), None);
+    }
+
+    /// 回归测试：行跨越 BUFFER_SIZE(4096) chunk 边界时，反向读取不能丢失/截断片段
+    #[tokio::test]
+    async fn test_lines_crossing_chunk_boundary() {
+        let dir = tempdir().unwrap();
+        let file_path = dir.path().join("chunk_cross.txt");
+
+        // 每行 300 字节，共 20 行（6000 字节 > BUFFER_SIZE 4096），
+        // 行边界会落在 chunk 边界两侧（第 4096 字节落在第 14 行内部）
+        let line_len = 300usize;
+        let mut content: Vec<u8> = Vec::new();
+        let mut expected: Vec<String> = Vec::new();
+        for i in 0..20 {
+            let mut line = format!("L{:02}-{}", i, "x".repeat(line_len - 5));
+            line.push('\n');
+            content.extend_from_slice(line.as_bytes());
+            expected.push(line.trim_end().to_string());
+        }
+        write_test_file(&file_path, &content);
+        // 保证确实跨越了 chunk 边界
+        assert!(content.len() > BUFFER_SIZE);
+        let mut pos = 0u64;
+        let mut expected_pos: Vec<(String, u64, u64)> = Vec::new();
+        for e in &expected {
+            let end = pos + (e.len() + 1) as u64; // +1 换行符
+            expected_pos.push((e.clone(), pos, end));
+            pos = end;
+        }
+
+        let mut reader = ReverseLineReader::new(&file_path, None, None).await.unwrap();
+        let mut got: Vec<(String, u64, u64)> = Vec::new();
+        while let Some(lp) = reader.next_line().await.unwrap() {
+            got.push((lp.line, lp.start_pos, lp.end_pos));
+        }
+
+        // 反向读取应与正向内容顺序相反，内容与位置完全一致
+        expected_pos.reverse();
+        assert_eq!(got.len(), expected_pos.len());
+        for (g, e) in got.iter().zip(expected_pos.iter()) {
+            assert_eq!(g, e, "line mismatch: got {:?} expected {:?}", g, e);
+        }
+    }
+
+    /// 回归测试：从中间位置（end_byte）反向读取，行同样可能跨 chunk 边界
+    #[tokio::test]
+    async fn test_lines_crossing_chunk_boundary_with_end() {
+        let dir = tempdir().unwrap();
+        let file_path = dir.path().join("chunk_cross_end.txt");
+
+        let line_len = 300usize;
+        let mut content: Vec<u8> = Vec::new();
+        let mut lines: Vec<String> = Vec::new();
+        for i in 0..20 {
+            let mut line = format!("L{:02}-{}", i, "y".repeat(line_len - 5));
+            line.push('\n');
+            content.extend_from_slice(line.as_bytes());
+            lines.push(line.trim_end().to_string());
+        }
+        write_test_file(&file_path, &content);
+        // 截断到第 15 行末尾（含换行）：每行 line_len=300 字节，前 15 行共 4500 字节
+        let line_size = line_len as u64; // "Lxx-" 4 字符 + (line_len-5) 填充 + '\n' = line_len 字节
+        let end_byte = 15 * line_size;
+        assert!(end_byte > BUFFER_SIZE as u64);
+
+        let mut reader = ReverseLineReader::new(&file_path, None, Some(end_byte)).await.unwrap();
+        let mut got: Vec<String> = Vec::new();
+        while let Some(lp) = reader.next_line().await.unwrap() {
+            got.push(lp.line);
+        }
+        // 期望：前 15 行倒序
+        let mut expected: Vec<String> = lines[..15].iter().rev().cloned().collect();
+        assert_eq!(got, expected);
     }
 }
