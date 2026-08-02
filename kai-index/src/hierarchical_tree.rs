@@ -148,23 +148,25 @@ where
         //如果最后节点为空，则需要递归移除
         if should_remove {
             //回溯并标记移除
-            let mut index = check_list.len()-1;
-            while should_remove {
+            //注意：从最深节点逐层回溯，标记需要移除子树的节点；
+            //回溯到根节点（index==0）时停止，避免 index 下溢 panic
+            let mut index = check_list.len();
+            while index > 0 && should_remove {
+                index -= 1;
                 let check = &mut check_list[index];
                 //标记移除本节点的这个子树
                 check.should_remove_sub_tree = true;
                 //如果只有这个子树，应该移除当前子树
                 should_remove = check.sub_tree_map_size == 1 && check.leaf_set_is_empty;
-                //回溯上一个子树
-                index -= 1;
             }
             //根据标记，直接移除最上层子树
             let mut current_tree_or_none = Some(&mut self.root);
             //搜索最上层要移除的子树
-            for token in tokens.iter() {
+            //check_list 按下标与深度对齐：check_list[i] 对应第 i 层节点的移除标记
+            for (i, token) in tokens.iter().enumerate() {
                 if let Some(current_tree) = current_tree_or_none.take() {
                     if let Some(sub_tree_map) = current_tree.sub_tree_map.as_mut() {
-                        if check_list[index].should_remove_sub_tree {
+                        if check_list.get(i).map_or(false, |c| c.should_remove_sub_tree) {
                             //移除子树
                             sub_tree_map.remove(token);
                             //无需继续遍历

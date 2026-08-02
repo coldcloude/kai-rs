@@ -110,4 +110,43 @@ mod tests {
         assert_eq!(r.len(), 1, "should find 1 for 'world'");
         assert_eq!(r[0], "k1");
     }
+
+    #[test]
+    fn test_substring_index_remove_partial() {
+        let mut idx: SubstringIndex<String> = SubstringIndex::new(32);
+        idx.insert(&"k1".to_string(), &crate::document::to_document("Alice"));
+        idx.insert(&"k2".to_string(), &crate::document::to_document("Alicia"));
+        // 移除 k1 后，另一个 key 的分支应保留（回溯只删到 k1 所在子树，不误删整树）
+        idx.remove(&"k1".to_string(), &crate::document::to_document("Alice"));
+        let r = idx.find_all_keys("Alice", false);
+        assert_eq!(r.len(), 0, "should find 0 for 'Alice' after removing k1");
+        let r = idx.find_all_keys("Alicia", false);
+        assert_eq!(r.len(), 1, "should find 1 for 'Alicia' after removing k1");
+        assert_eq!(r[0], "k2");
+    }
+
+    #[test]
+    fn test_substring_index_remove_shared_leaf() {
+        let mut idx: SubstringIndex<String> = SubstringIndex::new(32);
+        idx.insert(&"k1".to_string(), &crate::document::to_document("Alice"));
+        idx.insert(&"k2".to_string(), &crate::document::to_document("Alice Bob"));
+        // 两个 key 共享叶子节点，移除 k1 后 k2 仍在同一叶子中，应保持可查
+        idx.remove(&"k1".to_string(), &crate::document::to_document("Alice"));
+        let r = idx.find_all_keys("Bob", false);
+        assert_eq!(r.len(), 1, "should find 1 for 'Bob' after removing k1");
+        assert_eq!(r[0], "k2");
+        let r = idx.find_all_keys("Alice", false);
+        assert_eq!(r.len(), 1, "should find 1 for 'Alice' after removing k1");
+        assert_eq!(r[0], "k2");
+    }
+
+    #[test]
+    fn test_substring_index_remove_last() {
+        let mut idx: SubstringIndex<String> = SubstringIndex::new(32);
+        idx.insert(&"k1".to_string(), &crate::document::to_document("Alice"));
+        // 移除最后一个 key 后索引为空（原实现在此回溯循环 index 下溢 panic）
+        idx.remove(&"k1".to_string(), &crate::document::to_document("Alice"));
+        let r = idx.find_all_keys("Alice", false);
+        assert_eq!(r.len(), 0, "should find 0 after removing the last key");
+    }
 }
