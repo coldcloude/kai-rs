@@ -164,9 +164,14 @@ where
             //搜索最上层要移除的子树
             //check_list 按下标与深度对齐：check_list[i] 对应第 i 层节点的移除标记
             for (i, token) in tokens.iter().enumerate() {
+                //检查时未到此深处，结束
+                if i >= check_list.len() {
+                    break;
+                }
+                //处理子树遍历删除
                 if let Some(current_tree) = current_tree_or_none.take() {
                     if let Some(sub_tree_map) = current_tree.sub_tree_map.as_mut() {
-                        if check_list.get(i).map_or(false, |c| c.should_remove_sub_tree) {
+                        if check_list[i].should_remove_sub_tree {
                             //移除子树
                             sub_tree_map.remove(token);
                             //无需继续遍历

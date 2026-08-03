@@ -566,7 +566,7 @@ mod tests {
             got.push(lp.line);
         }
         // 期望：前 15 行倒序
-        let mut expected: Vec<String> = lines[..15].iter().rev().cloned().collect();
+        let expected: Vec<String> = lines[..15].iter().rev().cloned().collect();
         assert_eq!(got, expected);
     }
 }

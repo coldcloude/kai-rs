@@ -105,7 +105,6 @@ impl LineReader {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use tokio::io::AsyncWriteExt;
     use tempfile::tempdir;
 
     async fn write_file(dir: &tempfile::TempDir, name: &str, content: &[u8]) -> std::path::PathBuf {
@@ -384,7 +383,6 @@ mod tests {
     #[tokio::test]
     async fn test_lines_crossing_chunk_boundary() {
         let dir = tempdir().unwrap();
-        let file_path = dir.path().join("chunk_cross.txt");
 
         // 每行 300 字节（"Lxx-" 4 字符 + 295 填充 + '\n'），共 20 行 6000 字节 > BUFFER_SIZE，
         // 行边界会落在 chunk 边界两侧（第 4096 字节落在某行内部）
@@ -392,7 +390,7 @@ mod tests {
         let mut content: Vec<u8> = Vec::new();
         let mut expected: Vec<(String, u64, u64)> = Vec::new();
         for i in 0..20 {
-            let mut line = format!("L{:02}-{}", i, "a".repeat(line_len - 5));
+            let line = format!("L{:02}-{}", i, "a".repeat(line_len - 5));
             let start = content.len() as u64;
             content.extend_from_slice(line.as_bytes());
             content.push(b'\n');
@@ -414,14 +412,13 @@ mod tests {
     #[tokio::test]
     async fn test_lines_ending_at_chunk_boundary() {
         let dir = tempdir().unwrap();
-        let file_path = dir.path().join("chunk_boundary.txt");
 
         // 每行 256 字节，16 行共 4096 字节：第 16 行的 '\n' 恰好是文件最后一个字节
         let line_len = 256usize;
         let mut content: Vec<u8> = Vec::new();
         let mut expected: Vec<(String, u64, u64)> = Vec::new();
         for i in 0..16 {
-            let mut line = format!("B{:02}-{}", i, "b".repeat(line_len - 5));
+            let line = format!("B{:02}-{}", i, "b".repeat(line_len - 5));
             let start = content.len() as u64;
             content.extend_from_slice(line.as_bytes());
             content.push(b'\n');
@@ -443,13 +440,12 @@ mod tests {
     #[tokio::test]
     async fn test_custom_start_at_chunk_boundary() {
         let dir = tempdir().unwrap();
-        let file_path = dir.path().join("chunk_start.txt");
 
         let line_len = 256usize;
         let mut content: Vec<u8> = Vec::new();
         let mut expected: Vec<(String, u64, u64)> = Vec::new();
         for i in 0..16 {
-            let mut line = format!("C{:02}-{}", i, "c".repeat(line_len - 5));
+            let line = format!("C{:02}-{}", i, "c".repeat(line_len - 5));
             content.extend_from_slice(line.as_bytes());
             content.push(b'\n');
             expected.push((line, (i * line_len) as u64, ((i + 1) * line_len) as u64));

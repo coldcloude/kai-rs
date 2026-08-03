@@ -3,7 +3,7 @@ use std::fs;
 use std::env;
 use thiserror::Error;
 use syn::parse_file;
-use syn::{Data, DataStruct, Fields, FieldsNamed, Path, Type, TypePath};
+use syn::{Fields, FieldsNamed, Path, Type, TypePath};
 
 #[derive(Error, Debug)]
 enum CodegenError {
