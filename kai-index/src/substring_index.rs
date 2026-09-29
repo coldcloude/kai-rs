@@ -1,17 +1,17 @@
-use std::hash::Hash;
+use std::{fmt::Debug, hash::Hash};
 
 use crate::{DistinctIndex, Document, document::AsStr, index_search::IndexSearch, substring_tokenizer::{SubstringToken, SubstringTokenizer}};
 
 pub struct SubstringIndex<K>
 where
-    K: Eq + Hash + Clone + ToString + Send + Sync + 'static,
+    K: Eq + Hash + Clone + Debug + Send + Sync + 'static,
 {
     index_search: IndexSearch<SubstringToken,K,SubstringTokenizer,DistinctIndex<SubstringToken,K>>,
 }
 
 impl<K> SubstringIndex<K>
 where
-    K: Eq + Hash + Clone + ToString + Send + Sync + 'static,
+    K: Eq + Hash + Clone + Debug + Send + Sync + 'static,
 {
     pub fn new(max_depth: usize) -> Self {
         Self {

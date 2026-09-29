@@ -1,4 +1,4 @@
-use std::{hash::Hash};
+use std::{fmt::Debug, hash::Hash};
 use dashmap::{DashMap, DashSet};
 
 use crate::document::{AsStr, Document};
@@ -8,7 +8,7 @@ use serde::{Deserialize, Serialize};
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CompletionResult<K>
 where
-    K: Eq + Hash + Clone + ToString + 'static,
+    K: Eq + Hash + Clone + Debug + 'static,
 {
     pub completion: String,
     pub key: K,
@@ -16,21 +16,21 @@ where
 
 pub trait PrefixCompletion<K>
 where
-    K: Eq + Hash + Clone + ToString + 'static,
+    K: Eq + Hash + Clone + Debug + 'static,
 {
     fn complete(&self, prefix: &str) -> Vec<CompletionResult<K>>;
 }
 
 pub struct SimplePrefixCompletion<K>
 where
-    K: Eq + Hash + Clone + ToString + Send + Sync  + 'static,
+    K: Eq + Hash + Clone + Debug + Send + Sync  + 'static,
 {
     prefix_map: DashMap<String, DashMap<K, DashSet<String>>>,
 }
 
 impl<K> SimplePrefixCompletion<K>
 where
-    K: Eq + Hash + Clone + ToString + Send + Sync  + 'static,
+    K: Eq + Hash + Clone + Debug + Send + Sync  + 'static,
 {
     pub fn new() -> Self {
         Self {
@@ -74,7 +74,7 @@ where
 
 impl<K> PrefixCompletion<K> for SimplePrefixCompletion<K>
 where
-    K: Eq + Hash + Clone + ToString + Send + Sync  + 'static,
+    K: Eq + Hash + Clone + Debug + Send + Sync  + 'static,
 {
     fn complete(&self, prefix: &str) -> Vec<CompletionResult<K>> {
         let mut results = Vec::new();

@@ -1,4 +1,4 @@
-use std::{collections::{HashMap, HashSet, LinkedList, hash_map::Entry}, hash::Hash, marker::PhantomData, ops::Range, rc::Rc};
+use std::{collections::{HashMap, HashSet, LinkedList, hash_map::Entry}, fmt::Debug, hash::Hash, marker::PhantomData, ops::Range, rc::Rc};
 
 use crate::{CompletionResult, Document, PrefixCompletion, document::AsStr, index::{Index, IndexRemovable, IndexWithDetail, Split}, tokenizer::Tokenizer};
 
@@ -58,7 +58,7 @@ type CombinedPriorityResult<K> = HashMap<K,(usize,ResultIndexMap)>;
 
 fn combine_raw_result<K>(result: &mut CombinedResult<K>, raw_result: &mut RawResult<K>, token_len: usize, intersect: bool)
 where
-    K: Eq + Hash + Clone + ToString + 'static,
+    K: Eq + Hash + Clone + Debug + 'static,
 {
     //交集模式，先清理不匹配的
     if intersect {
@@ -92,7 +92,7 @@ where
 
 fn combine_priority_result<K>(priority_result: &mut CombinedPriorityResult<K>, result: &mut CombinedResult<K>, priority: usize)
 where
-    K: Eq + Hash + Clone + ToString + 'static,
+    K: Eq + Hash + Clone + Debug + 'static,
 {
     for (key, index_map) in result.drain() {
         match priority_result.entry(key) {
@@ -110,7 +110,7 @@ where
 
 fn combine_priority_key_map<K>(priority_result: &mut HashMap<K,usize>, result: &mut HashSet<K>, priority: usize)
 where
-    K: Eq + Hash + Clone + ToString + 'static,
+    K: Eq + Hash + Clone + Debug + 'static,
 {
     for key in result.drain() {
         match priority_result.entry(key) {
@@ -178,7 +178,7 @@ where
 
     pub fn find<K,IDX>(&self, priority_result: &mut HashMap<K,usize>, index: &IDX)
     where
-        K: Eq + Hash + Clone + ToString + 'static,
+        K: Eq + Hash + Clone + Debug + 'static,
         IDX: Index<T,K>,
     {
         //对tokens去重
@@ -237,7 +237,7 @@ where
 pub struct IndexSearch<T,K,TKNZ,IDX>
 where
     T: Eq + Hash + Clone + 'static,
-    K: Eq + Hash + Clone + ToString + 'static,
+    K: Eq + Hash + Clone + Debug + 'static,
     TKNZ: Tokenizer<T>,
     IDX: Index<T,K>,
 {
@@ -249,7 +249,7 @@ where
 impl<T,K,TKNZ,IDX> IndexSearch<T,K,TKNZ,IDX>
 where
     T: Eq + Hash + Clone + 'static,
-    K: Eq + Hash + Clone + ToString + 'static,
+    K: Eq + Hash + Clone + Debug + 'static,
     TKNZ: Tokenizer<T>,
     IDX: Index<T,K>,
 {
@@ -323,7 +323,7 @@ where
 impl<T,K,TKNZ,IDX> IndexSearch<T,K,TKNZ,IDX>
 where
     T: Eq + Hash + Clone + 'static,
-    K: Eq + Hash + Clone + ToString + 'static,
+    K: Eq + Hash + Clone + Debug + 'static,
     TKNZ: Tokenizer<T>,
     IDX: IndexRemovable<T,K>,
 {
@@ -340,7 +340,7 @@ where
 impl<T,K,TKNZ,IDX> IndexSearch<T,K,TKNZ,IDX>
 where
     T: Eq + Hash + Clone + 'static,
-    K: Eq + Hash + Clone + ToString + 'static,
+    K: Eq + Hash + Clone + Debug + 'static,
     TKNZ: Tokenizer<T>,
     IDX: IndexWithDetail<T,K>,
 {
@@ -352,7 +352,7 @@ where
 impl<T,K,TKNZ,IDX> PrefixCompletion<K> for IndexSearch<T,K,TKNZ,IDX>
 where
     T: Eq + Hash + Clone + 'static,
-    K: Eq + Hash + Clone + ToString + 'static,
+    K: Eq + Hash + Clone + Debug + 'static,
     TKNZ: Tokenizer<T>,
     IDX: IndexWithDetail<T,K>,
 {

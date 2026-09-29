@@ -1,4 +1,4 @@
-use std::{collections::{HashMap, HashSet, LinkedList}, hash::Hash};
+use std::{collections::{HashMap, HashSet, LinkedList}, fmt::Debug, hash::Hash};
 
 use crate::{Index, hierarchical_tree::{Collection, HierarchicalTree}, index::IndexRemovable};
 
@@ -97,14 +97,14 @@ where
 
 struct DistinctIndexCollection<K>
 where
-    K: Eq + Hash + Clone + ToString + 'static,
+    K: Eq + Hash + Clone + Debug + 'static,
 {
     key_set: HashSet<K>,
 }
 
 impl<K> Collection<K,K,HashSet<K>> for DistinctIndexCollection<K>
 where
-    K: Eq + Hash + Clone + ToString + 'static,
+    K: Eq + Hash + Clone + Debug + 'static,
 {
     fn new() -> Self {
         Self {
@@ -136,7 +136,7 @@ type DistinctIndexTree<T,K> = HierarchicalTree<T,K,K,HashSet<K>,DistinctIndexCol
 pub struct DistinctIndex<T,K>
 where
     T: Eq + Hash + Clone + 'static,
-    K: Eq + Hash + Clone + ToString + 'static,
+    K: Eq + Hash + Clone + Debug + 'static,
 {
     tree: DistinctIndexTree<T,K>,
     max_depth: usize,
@@ -145,7 +145,7 @@ where
 impl<T,K> DistinctIndex<T,K>
 where
     T: Eq + Hash + Clone + 'static,
-    K: Eq + Hash + Clone + ToString + 'static,
+    K: Eq + Hash + Clone + Debug + 'static,
 {
     pub fn new(max_depth: usize) -> Self {
         Self {
@@ -158,7 +158,7 @@ where
 impl<T,K> Index<T,K> for DistinctIndex<T,K>
 where
     T: Eq + Hash + Clone + 'static,
-    K: Eq + Hash + Clone + ToString + 'static,
+    K: Eq + Hash + Clone + Debug + 'static,
 {
     fn insert(&mut self, key: &K, contents: impl IntoIterator<Item = Vec<T>>) {
         let single_index = build_single_index(contents, self.max_depth);
@@ -177,7 +177,7 @@ where
 impl<T,K> IndexRemovable<T,K> for DistinctIndex<T,K>
 where
     T: Eq + Hash + Clone + 'static,
-    K: Eq + Hash + Clone + ToString + 'static,
+    K: Eq + Hash + Clone + Debug + 'static,
 {
     fn remove(&mut self, key: &K, contents: impl IntoIterator<Item = Vec<T>>) {
         let single_index = build_single_index(contents, self.max_depth);

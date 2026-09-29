@@ -1,17 +1,17 @@
-use std::hash::Hash;
+use std::{fmt::Debug, hash::Hash};
 
 use crate::{PrefixCompletion, CompletionResult, Document, atomic_index::AtomicIndex, document::AsStr, error::Result, index_search::IndexSearch, splintr_tokenizer::SplintrTokenizer};
 
 pub struct SplintrIndex<K>
 where
-    K: Eq + Hash + Clone + ToString + Send + Sync + 'static,
+    K: Eq + Hash + Clone + Debug + Send + Sync + 'static,
 {
     index_search: IndexSearch<u32,K,SplintrTokenizer,AtomicIndex<u32,K>>,
 }
 
 impl<K> SplintrIndex<K>
 where
-    K: Eq + Hash + Clone + ToString + Send + Sync + 'static,
+    K: Eq + Hash + Clone + Debug + Send + Sync + 'static,
 {
     pub fn new(tokenizer_name: &str, max_depth: usize) -> Result<Self> {
         let tokenizer = SplintrTokenizer::new(tokenizer_name)?;

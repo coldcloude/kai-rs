@@ -1,4 +1,4 @@
-use std::{collections::{HashMap, HashSet, LinkedList}, hash::Hash, sync::Arc};
+use std::{collections::{HashMap, HashSet, LinkedList}, fmt::Debug, hash::Hash, sync::Arc};
 
 use dashmap::DashMap;
 use parking_lot::RwLock;
@@ -10,7 +10,7 @@ type TokenNodeRef<T,K> = Arc<RwLock<TokenNode<T,K>>>;
 struct TokenNode<T,K>
 where
     T: Eq + Hash + Clone + Send + Sync + 'static,
-    K: Eq + Hash + Clone + Send + Sync + ToString + 'static,
+    K: Eq + Hash + Clone + Send + Sync + Debug + 'static,
 {
     sub_tree_map: Option<Arc<DashMap<T,TokenNodeRef<T,K>>>>,
     leaf_set: Option<Arc<DashMap<K,Vec<Split>>>>,
@@ -19,7 +19,7 @@ where
 impl<T,K> TokenNode<T,K>
 where
     T: Eq + Hash + Clone + Send + Sync + 'static,
-    K: Eq + Hash + Clone + Send + Sync + ToString + 'static,
+    K: Eq + Hash + Clone + Send + Sync + Debug + 'static,
 {
     pub fn new() -> Self {
         Self {
@@ -32,7 +32,7 @@ where
 pub struct AtomicIndex<T,K>
 where
     T: Eq + Hash + Clone + Send + Sync + 'static,
-    K: Eq + Hash + Clone + Send + Sync + ToString + 'static,
+    K: Eq + Hash + Clone + Send + Sync + Debug + 'static,
 {
     tree: TokenNodeRef<T,K>,
     prefix_tree: TokenNodeRef<T,K>,
@@ -43,7 +43,7 @@ where
 impl<T,K> AtomicIndex<T,K>
 where
     T: Eq + Hash + Clone + Send + Sync + 'static,
-    K: Eq + Hash + Clone + Send + Sync + ToString + 'static,
+    K: Eq + Hash + Clone + Send + Sync + Debug + 'static,
 {
     pub fn new(max_depth: usize) -> Self {
         Self {
@@ -167,7 +167,7 @@ where
 impl<T,K> Index<T,K> for AtomicIndex<T,K>
 where
     T: Eq + Hash + Clone + Send + Sync + 'static,
-    K: Eq + Hash + Clone + Send + Sync + ToString + 'static,
+    K: Eq + Hash + Clone + Send + Sync + Debug + 'static,
 {
     fn insert(&mut self, key: &K, contents: impl IntoIterator<Item = Vec<T>>) {
         let mut documents_guard = self.documents.write();
@@ -188,7 +188,7 @@ where
 impl<T,K> IndexWithDetail<T,K> for AtomicIndex<T,K>
 where
     T: Eq + Hash + Clone + Send + Sync + 'static,
-    K: Eq + Hash + Clone + Send + Sync + ToString + 'static,
+    K: Eq + Hash + Clone + Send + Sync + Debug + 'static,
 {
     fn remove(&mut self, key: &K) {
         let mut documents_guard = self.documents.write();
@@ -264,6 +264,7 @@ where
                 return Ok(content.clone());
             }
         }
-        Err(Error::DocumentContentNotFound(key.to_string(), index))
+        // key 只要求 Debug（`Arc<K>` 没有 Display/ToString，Display 无法为 Arc 补充实现）
+        Err(Error::DocumentContentNotFound(format!("{key:?}"), index))
     }
 }

@@ -1,11 +1,11 @@
-use std::{collections::{HashMap, HashSet, LinkedList, hash_map::Entry}, hash::Hash};
+use std::{collections::{HashMap, HashSet, LinkedList, hash_map::Entry}, fmt::Debug, hash::Hash};
 
 use crate::{Error, error::Result, index::{Index, IndexWithDetail, Split}};
 
 struct TokenNode<T,K>
 where
     T: Eq + Hash + Clone + 'static,
-    K: Eq + Hash + Clone + ToString + 'static,
+    K: Eq + Hash + Clone + Debug + 'static,
 {
     sub_tree_map: Option<HashMap<T,TokenNode<T,K>>>,
     leaf_set: Option<HashMap<K,Vec<Split>>>,
@@ -14,7 +14,7 @@ where
 impl<T,K> TokenNode<T,K>
 where
     T: Eq + Hash + Clone + 'static,
-    K: Eq + Hash + Clone + ToString + 'static,
+    K: Eq + Hash + Clone + Debug + 'static,
 {
     pub fn new() -> Self {
         Self {
@@ -91,7 +91,7 @@ where
 pub struct RecursiveIndex<T,K>
 where
     T: Eq + Hash + Clone + 'static,
-    K: Eq + Hash + Clone + ToString + 'static,
+    K: Eq + Hash + Clone + Debug + 'static,
 {
     tree: TokenNode<T,K>,
     prefix_tree: TokenNode<T,K>,
@@ -102,7 +102,7 @@ where
 impl<T,K> RecursiveIndex<T,K>
 where
     T: Eq + Hash + Clone + 'static,
-    K: Eq + Hash + Clone + ToString + 'static,
+    K: Eq + Hash + Clone + Debug + 'static,
 {
     pub fn new(max_depth: usize) -> Self {
         Self {
@@ -155,7 +155,7 @@ where
 impl<T,K> Index<T,K> for RecursiveIndex<T,K>
 where
     T: Eq + Hash + Clone + 'static,
-    K: Eq + Hash + Clone + ToString + 'static,
+    K: Eq + Hash + Clone + Debug + 'static,
 {
     fn insert(&mut self, key: &K, contents: impl IntoIterator<Item = Vec<T>>) {
         let mut tokens_list = Vec::new();
@@ -176,7 +176,7 @@ where
 impl<T,K> IndexWithDetail<T,K> for RecursiveIndex<T,K>
 where
     T: Eq + Hash + Clone + 'static,
-    K: Eq + Hash + Clone + ToString + 'static,
+    K: Eq + Hash + Clone + Debug + 'static,
 {
     fn remove(&mut self, key: &K) {
         if let Some(tokens_list) = self.documents.remove(key) {
@@ -227,6 +227,7 @@ where
                 return Ok(content.clone());
             }
         }
-        Err(Error::DocumentContentNotFound(key.to_string(), index))
+        // key 只要求 Debug（`Arc<K>` 没有 Display/ToString，Display 无法为 Arc 补充实现）
+        Err(Error::DocumentContentNotFound(format!("{key:?}"), index))
     }
 }

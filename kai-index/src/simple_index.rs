@@ -1,17 +1,17 @@
-use std::{collections::{HashMap, HashSet}, hash::Hash};
+use std::{collections::{HashMap, HashSet}, fmt::Debug, hash::Hash};
 
 use crate::{Error, error::Result, hierarchical_tree::{Collection, HierarchicalTree}, index::{Index, IndexWithDetail, Split}};
 
 struct SimpleIndexCollection<K>
 where
-    K: Eq + Hash + Clone + ToString + 'static,
+    K: Eq + Hash + Clone + Debug + 'static,
 {
     index_map: HashMap<K,Vec<Split>>,
 }
 
 impl<K> Collection<(K,Split),K,HashMap<K,Vec<Split>>> for SimpleIndexCollection<K>
 where
-    K: Eq + Hash + Clone + ToString + 'static,
+    K: Eq + Hash + Clone + Debug + 'static,
 {
     fn new() -> Self {
         Self {
@@ -47,7 +47,7 @@ type SimpleIndexTree<T,K> = HierarchicalTree<T,(K,Split),K,HashMap<K,Vec<Split>>
 pub struct SimpleIndex<T,K>
 where
     T: Eq + Hash + Clone + 'static,
-    K: Eq + Hash + Clone + ToString + 'static,
+    K: Eq + Hash + Clone + Debug + 'static,
 {
     tree: SimpleIndexTree<T,K>,
     prefix_tree: SimpleIndexTree<T,K>,
@@ -58,7 +58,7 @@ where
 impl<T,K> SimpleIndex<T,K>
 where
     T: Eq + Hash + Clone + 'static,
-    K: Eq + Hash + Clone + ToString + 'static,
+    K: Eq + Hash + Clone + Debug + 'static,
 {
     pub fn new(max_depth: usize) -> Self {
         Self {
@@ -73,7 +73,7 @@ where
 impl<T,K> Index<T,K> for SimpleIndex<T,K>
 where
     T: Eq + Hash + Clone + 'static,
-    K: Eq + Hash + Clone + ToString + 'static,
+    K: Eq + Hash + Clone + Debug + 'static,
 {
     fn insert(&mut self, key: &K, contents: impl IntoIterator<Item = Vec<T>>) {
         let mut tokens_list = Vec::new();
@@ -106,7 +106,7 @@ where
 impl<T,K> IndexWithDetail<T,K> for SimpleIndex<T,K>
 where
     T: Eq + Hash + Clone + 'static,
-    K: Eq + Hash + Clone + ToString + 'static,
+    K: Eq + Hash + Clone + Debug + 'static,
 {
     fn remove(&mut self, key: &K) {
         if let Some(tokens_list) = self.documents.remove(key) {
@@ -149,6 +149,7 @@ where
                 return Ok(content.clone());
             }
         }
-        Err(Error::DocumentContentNotFound(key.to_string(), index))
+        // key 只要求 Debug（`Arc<K>` 没有 Display/ToString，Display 无法为 Arc 补充实现）
+        Err(Error::DocumentContentNotFound(format!("{key:?}"), index))
     }
 }

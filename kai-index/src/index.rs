@@ -1,4 +1,4 @@
-use std::{collections::{HashMap, HashSet}, hash::Hash};
+use std::{collections::{HashMap, HashSet}, fmt::Debug, hash::Hash};
 
 use crate::{error::Result};
 
@@ -10,7 +10,7 @@ pub struct Split {
 pub trait Index<T,K>
 where
     T: Eq + Hash + Clone + 'static,
-    K: Eq + Hash + Clone + ToString + 'static,
+    K: Eq + Hash + Clone + Debug + 'static,
 {
     fn insert(&mut self, key: &K, contents: impl IntoIterator<Item = Vec<T>>);
 
@@ -21,7 +21,7 @@ where
 pub trait IndexRemovable<T,K> : Index<T,K>
 where
     T: Eq + Hash + Clone + 'static,
-    K: Eq + Hash + Clone + ToString + 'static,
+    K: Eq + Hash + Clone + Debug + 'static,
 {
     fn remove(&mut self, key: &K, contents: impl IntoIterator<Item = Vec<T>>);
 }
@@ -29,7 +29,7 @@ where
 pub trait IndexWithDetail<T,K> : Index<T,K>
 where
     T: Eq + Hash + Clone + 'static,
-    K: Eq + Hash + Clone + ToString + 'static,
+    K: Eq + Hash + Clone + Debug + 'static,
 {
     fn remove(&mut self, key: &K);
 

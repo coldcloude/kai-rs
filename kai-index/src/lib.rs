@@ -149,4 +149,32 @@ mod tests {
         let r = idx.find_all_keys("Alice", false);
         assert_eq!(r.len(), 0, "should find 0 after removing the last key");
     }
+
+    #[test]
+    fn test_substring_index_arc_key() {
+        use std::sync::Arc;
+
+        // 索引 key 允许使用 `Arc<K>`：key 只要求 Eq + Hash + Clone + Debug，
+        // Arc<K> 满足这些约束（K 自身不再需要 ToString），且按内容比较/哈希。
+        #[derive(Clone, Debug, PartialEq, Eq, Hash)]
+        struct Key {
+            agent_id: String,
+            role_name: String,
+        }
+
+        let mut idx: SubstringIndex<Arc<Key>> = SubstringIndex::new(32);
+        let k1 = Arc::new(Key { agent_id: "a1".into(), role_name: "dev".into() });
+        let k2 = Arc::new(Key { agent_id: "a1".into(), role_name: "dev".into() });
+        assert!(!Arc::ptr_eq(&k1, &k2), "两次构造是不同分配");
+
+        idx.insert(&k1, &crate::document::to_document("Alice"));
+        // 内容相同的另一把 Arc<Key> 命中同一项（Arc<K> 按内容而非指针比较）
+        let found = idx.find_all_keys("Alice", false);
+        assert_eq!(found.len(), 1);
+        assert_eq!(*found[0], *k2);
+
+        // 移除同样可以用内容相同的另一把 Arc<Key>
+        idx.remove(&k2, &crate::document::to_document("Alice"));
+        assert_eq!(idx.find_all_keys("Alice", false).len(), 0);
+    }
 }
