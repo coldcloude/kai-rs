@@ -1,5 +1,7 @@
 use std::{rc::Rc, sync::Arc};
 
+use arcstr::ArcStr;
+
 pub trait AsStr {
     fn as_string(&self) -> &str;
 }
@@ -21,6 +23,12 @@ impl AsStr for Rc<String> {
 }
 
 impl AsStr for Arc<String> {
+    fn as_string(&self) -> &str {
+        self.as_str()
+    }
+}
+
+impl AsStr for ArcStr {
     fn as_string(&self) -> &str {
         self.as_str()
     }
