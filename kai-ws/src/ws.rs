@@ -3,6 +3,7 @@ use std::sync::{Arc, RwLock, atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering
 use async_trait::async_trait;
 use dashmap::DashMap;
 use flume::{Receiver, Sender, bounded};
+use http::HeaderName;
 use serde::{Deserialize, Serialize};
 use bytes::{BufMut, Bytes, BytesMut};
 use tokio::{net::TcpStream, time::{Duration, Instant}, io::{AsyncRead, AsyncWrite}};
@@ -369,14 +370,12 @@ pub async fn ws_handle_connection<C: WsProcessorContext>(stream: TcpStream, queu
 /// 作为客户端建立 WebSocket 连接。
 /// headers 用于握手阶段携带自定义请求头（如 X-Api-Key 认证）。
 /// 与服务端 ws_handle_connection 对称：创建 WsContext、执行 initializer、启动收发循环。
-pub async fn ws_connect<C: WsProcessorContext>(url: &str, headers: &[(String, String)], queue_capacity: usize, processor_context: Arc<C>) -> Result<()> {
+pub async fn ws_connect<C: WsProcessorContext>(url: &str, headers: &[(&HeaderName, String)], queue_capacity: usize, processor_context: Arc<C>) -> Result<()> {
     let mut request = url.into_client_request()?;
-    for (name, value) in headers {
-        let header_name = http::HeaderName::from_bytes(name.as_bytes())
-            .map_err(|_| Error::InvalidHeader(format!("invalid header name: {}", name)))?;
+    for (header_name, value) in headers {
         let header_value = http::HeaderValue::from_str(value)
             .map_err(|_| Error::InvalidHeader(format!("invalid header value: {}", value)))?;
-        request.headers_mut().insert(header_name, header_value);
+        request.headers_mut().insert(*header_name, header_value);
     }
     let (ws_stream, _) = connect_async(request).await?;
     let context = Arc::new(WsContext::new(queue_capacity));
@@ -1132,7 +1131,7 @@ mod tests {
             ws_handle_connection_with_filter(stream, 16, Arc::new(EchoServerCtx), &[&filter]).await.unwrap();
         });
 
-        let headers = [("X-Test-Key".to_string(), "yes".to_string())];
+        let headers = [(&HeaderName::from_static("x-test-key"), "yes".to_string())];
         let client_ctx = Arc::new(EmptyClientCtx { ws: tokio::sync::Mutex::new(None) });
         ws_connect(&format!("ws://{}", addr), &headers, 16, client_ctx.clone())
             .await.unwrap();
