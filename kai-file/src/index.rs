@@ -8,7 +8,7 @@ use std::marker::PhantomData;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use tokio::sync::RwLock;
-use std::collections::{BTreeMap, LinkedList};
+use std::collections::BTreeMap;
 
 use kai_date::as_minute;
 
@@ -177,21 +177,22 @@ impl FileIndices {
         let end_byte = self.page_index.get(page + 1).copied().unwrap_or(self.end_pos);
 
         let mut reader = ReverseLineReader::new(&file_path, None, Some(end_byte)).await?;
-        let mut results = LinkedList::new();
+        let mut results = Vec::new();
         let mut cur_line = self.end_line_index.min((page as u32 + 1) * 1000);
 
         while let Some(line_with_pos) = reader.next_line().await? {
             cur_line -= 1;
             if cur_line <= line {
                 let record = serde_json::from_str::<R>(line_with_pos.line.as_str())?;
-                results.push_front((cur_line, Arc::new(record)));
+                results.push((cur_line, Arc::new(record)));
                 if results.len() as u32 >= n {
                     break;
                 }
             }
         }
 
-        Ok(results.into_iter().collect())
+        results.reverse();
+        Ok(results)
     }
 
     pub async fn query_first<R: Record>(

@@ -36,13 +36,18 @@
 - 每行返回 LineWithPosition（line、start_pos、end_pos），字节位置与倒序读取一致，可交叉使用
 
 ### 批量追加机制（appender）
-- FileObjectAppender 按 key 管理一组追加缓冲区，append() 只写入内存队列后立即返回
+- FileObjectAppender 按 key 管理一组追加缓冲区，append() 只写入内存队列后立即返回，返回值为该次追加的落盘承诺（oneshot::Receiver<Result<()>>）
 - 每个 key 首次 append 时创建缓冲区并启动 flush 任务，满足任一条件即触发落盘：
   - 累计记录数达到 batch_size（通过 Notify 唤醒）
   - 距缓冲区创建超过 timeout
-- flush 时通过 writer.get_lock(key) 获取该 key 的写入上下文锁，排空队列合并为一个批次，调用上下文 write() 落盘；落盘完成后移除缓冲区和锁
+- flush 开始时先从 map 移除缓冲区并关闭接收端，再通过 writer.get_lock(key) 获取该 key 的写入上下文锁，排空队列合并为一个批次，调用上下文 write() 落盘
+- 批次内记录顺序与 append 调用顺序一致（队列为 FIFO，合并时不重排）
+- 落盘结束后（无论成功或失败）必须调用 writer.remove_lock(key) 回收锁
 - flush 期间到达的 append 因缓冲区已移除而自动创建新缓冲区重试，不会丢数据
-- 写入失败时回调 ErrorHandler（携带 key、整批记录和错误），默认 NoopErrorHandler 忽略
+- 落盘结果通过两条并行的通道反馈：
+  - 承诺：成功后兑现 Ok(())，失败后兑现 Err(WriteError)；同一批次内所有承诺结果一致，不会一部分 Ok 一部分 Err
+  - ErrorHandler：写入失败时额外回调（携带 key、整批记录和错误），默认 NoopErrorHandler 忽略
+- 调用方可丢弃承诺（只关心尽力而为），也可 await 它确认该记录已落盘
 - 调用方需实现两组 trait：
   - FileAppendWriter：按 key 提供/回收写入上下文锁（get_lock / remove_lock）
   - FileAppendWriterContext：执行实际的批量写入（write）

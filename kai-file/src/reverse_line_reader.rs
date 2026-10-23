@@ -1,5 +1,3 @@
-use std::collections::LinkedList;
-
 use tokio::fs::File;
 use tokio::io::{AsyncReadExt, AsyncSeekExt, SeekFrom};
 use crate::error::Result;
@@ -20,7 +18,9 @@ pub struct ReverseLineReader {
     current_pos: u64,
     buffer: Vec<u8>,
     buffer_end: usize,
-    splits: LinkedList<(Vec<u8>, u64, u64)>,
+    //片段按“新块在尾”压栈（push），读取时自尾向头弹出（pop），
+    //弹出的顺序即文件内从左到右的正序
+    splits: Vec<(Vec<u8>, u64, u64)>,
 }
 
 impl ReverseLineReader {
@@ -37,55 +37,53 @@ impl ReverseLineReader {
             current_pos: file_end_pos,
             buffer: vec![0; BUFFER_SIZE],
             buffer_end: 0,
-            splits: LinkedList::new(),
+            splits: Vec::new(),
         })
     }
 
     fn save_buffer(&mut self, start: usize, end: usize) {
         let start_pos = self.current_pos + start as u64;
         let end_pos = self.current_pos + end as u64;
-        self.splits.push_front((self.buffer[start..end].to_vec(), start_pos, end_pos));
+        self.splits.push((self.buffer[start..end].to_vec(), start_pos, end_pos));
     }
 
     fn pop_line_without_newline(&mut self) -> Result<Option<LineWithPosition>> {
         if self.splits.is_empty() {
             return Ok(None);
         }
-        else {
-            //计算总长
-            let mut len = 0 as usize;
-            let mut start_pos = self.file_end_pos;
-            let mut end_pos = self.file_start_pos;
-            for (split, s, e) in self.splits.iter() {
-                len += split.len();
-                if *s < start_pos {
-                    start_pos = *s;
-                }
-                if *e > end_pos {
-                    end_pos = *e;
-                }
+        //计算总长
+        let mut len = 0 as usize;
+        let mut start_pos = self.file_end_pos;
+        let mut end_pos = self.file_start_pos;
+        for (split, s, e) in self.splits.iter() {
+            len += split.len();
+            if *s < start_pos {
+                start_pos = *s;
             }
-            let mut line = Vec::with_capacity(len);
-            while let Some(split) = self.splits.pop_front() {
-                //最后一个split移除结尾换行符，但pos应包含换行符
-                let mut end = split.0.len();
-                if self.splits.is_empty() {
-                    if end > 0 && split.0[end - 1] == b'\n' {
+            if *e > end_pos {
+                end_pos = *e;
+            }
+        }
+        let mut line = Vec::with_capacity(len);
+        while let Some(split) = self.splits.pop() {
+            //最后一个split移除结尾换行符，但pos应包含换行符
+            let mut end = split.0.len();
+            if self.splits.is_empty() {
+                if end > 0 && split.0[end - 1] == b'\n' {
+                    end -= 1;
+                    if end > 0 && split.0[end - 1] == b'\r' {
                         end -= 1;
-                        if end > 0 && split.0[end - 1] == b'\r' {
-                            end -= 1;
-                        }
                     }
                 }
-                line.extend_from_slice(&split.0[..end]);
             }
-            let result = String::from_utf8(line)?;
-            Ok(Some(LineWithPosition {
-                line: result,
-                start_pos,
-                end_pos,
-            }))
+            line.extend_from_slice(&split.0[..end]);
         }
+        let result = String::from_utf8(line)?;
+        Ok(Some(LineWithPosition {
+            line: result,
+            start_pos,
+            end_pos,
+        }))
     }
 
     pub async fn next_line(&mut self) -> Result<Option<LineWithPosition>> {
